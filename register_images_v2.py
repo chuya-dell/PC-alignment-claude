@@ -9,8 +9,13 @@ v1からの改善点:
   3. 回転と平行移動を1つのアフィン変換に合成して1回だけワープ
      → 補間による画像劣化が1回分で済む
   4. 粗い位置合わせ後にECC（相関係数最大化）による精密位置合わせを追加
-     → 画像全体の情報を使ってサブピクセルで一致率を直接最大化
-  5. 一致率（正規化相互相関 NCC）を補正前/粗補正/精密補正で表示
+     → キズ（スクラッチ）周辺の帯領域だけで相関を評価し、サブピクセルで
+       一致率を直接最大化。基板上のキズが位置合わせの基準であり、
+       画像内部の試料は画像間で変化しうるため、内部の変化に
+       引っ張られないようマスクで除外する
+  5. 一致率（正規化相互相関 NCC）をキズ部/画像全体それぞれ表示
+     ※キズ部NCC = 位置合わせ精度の指標
+       全体NCC = 試料の変化も含んだ画像の一致度
   6. 入力画像のビット深度（uint16等）を保持して保存
 """
 
@@ -29,7 +34,8 @@ ROW_SEARCH = (1800, 2044)       # 横線スクラッチのrow範囲
 USE_ECC = True                  # ECC精密位置合わせを使う
 ECC_ITERATIONS = 200
 ECC_EPS = 1e-7
-NCC_MARGIN = 180                # NCC計算時に除外する外周幅(px)
+ECC_SCRATCH_BAND = 40           # キズ中心から±何pxの帯をECC/一致率評価に使うか
+NCC_MARGIN = 180                # 全体NCC計算時に除外する外周幅(px)
 # ================
 
 
@@ -141,7 +147,7 @@ def valid_mask(shape, M, erode_px=8):
 
 
 def ncc(ref, img, margin=NCC_MARGIN):
-    """外周marginを除いた領域の正規化相互相関（一致率）"""
+    """外周marginを除いた領域の正規化相互相関（画像全体の一致率）"""
     a = ref[margin:-margin, margin:-margin].astype(np.float64).ravel()
     b = img[margin:-margin, margin:-margin].astype(np.float64).ravel()
     a = a - a.mean()
@@ -150,6 +156,34 @@ def ncc(ref, img, margin=NCC_MARGIN):
     if denom < 1e-12:
         return 0.0
     return float(np.dot(a, b) / denom)
+
+
+def masked_ncc(ref, img, mask):
+    """マスク領域内の正規化相互相関（キズ部の一致率評価に使用）"""
+    sel = mask > 0
+    a = ref[sel].astype(np.float64)
+    b = img[sel].astype(np.float64)
+    a = a - a.mean()
+    b = b - b.mean()
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    if denom < 1e-12:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+
+def scratch_mask(shape, col, row, band=ECC_SCRATCH_BAND):
+    """縦キズ・横キズ周辺の帯領域マスク（uint8）
+
+    位置合わせの基準は基板端のキズなので、精密位置合わせ(ECC)と
+    キズ部一致率の評価はこの領域に限定する。
+    """
+    h, w = shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    c = int(round(col))
+    r = int(round(row))
+    mask[:, max(0, c - band):min(w, c + band + 1)] = 255   # 縦キズの帯
+    mask[max(0, r - band):min(h, r + band + 1), :] = 255   # 横キズの帯
+    return mask
 
 
 def refine_ecc(ref, moving, mask=None):
@@ -201,26 +235,36 @@ def register_to_reference(img, ref, ref_angle, ref_col, ref_row, verbose=True):
     M_coarse = compose_rot_trans(rot_angle, dx, dy, img.shape)
     img_coarse = warp_affine(img, M_coarse)
 
+    # 一致率評価用マスク: 基準画像のキズ周辺の帯
+    s_mask = scratch_mask(ref.shape, ref_col, ref_row)
+
     ncc_before = ncc(ref, img)
     ncc_coarse = ncc(ref, img_coarse)
+    sncc_before = masked_ncc(ref, img, s_mask)
+    sncc_coarse = masked_ncc(ref, img_coarse, s_mask)
 
     # Step3: ECCによる精密位置合わせ（粗補正への残差をサブピクセル推定）
+    # 位置合わせの基準はキズなので、相関評価はキズ周辺の帯に限定し、
+    # 画像内部の試料の変化に引っ張られないようにする
     M_final = M_coarse
     img_final = img_coarse
     ncc_final = ncc_coarse
+    sncc_final = sncc_coarse
     ecc_used = False
     if USE_ECC:
-        mask = valid_mask(img.shape, M_coarse)
+        mask = cv2.bitwise_and(valid_mask(img.shape, M_coarse), s_mask)
         fwd_res, _ = refine_ecc(ref, img_coarse, mask)
         if fwd_res is not None:
             M3_res = np.vstack([fwd_res, [0, 0, 1]])
             M3_coarse = np.vstack([M_coarse, [0, 0, 1]])
             M_refined = (M3_res @ M3_coarse)[:2]
             img_refined = warp_affine(img, M_refined)
-            ncc_refined = ncc(ref, img_refined)
-            # 一致率が改善する場合のみ採用
-            if ncc_refined >= ncc_coarse:
-                M_final, img_final, ncc_final = M_refined, img_refined, ncc_refined
+            sncc_refined = masked_ncc(ref, img_refined, s_mask)
+            # キズ部の一致率が改善する場合のみ採用
+            if sncc_refined >= sncc_coarse:
+                M_final, img_final = M_refined, img_refined
+                sncc_final = sncc_refined
+                ncc_final = ncc(ref, img_refined)
                 ecc_used = True
 
     # 最終変換から回転・平行移動を読み取る（レポート用）
@@ -231,15 +275,19 @@ def register_to_reference(img, ref, ref_angle, ref_col, ref_row, verbose=True):
     info = {
         "rot": final_rot, "dx": dx, "dy": dy,
         "ncc_before": ncc_before, "ncc_coarse": ncc_coarse,
-        "ncc_final": ncc_final, "ecc_used": ecc_used,
+        "ncc_final": ncc_final,
+        "sncc_before": sncc_before, "sncc_coarse": sncc_coarse,
+        "sncc_final": sncc_final,
+        "ecc_used": ecc_used,
         "M": M_final,
     }
     if verbose:
         print(f"  縦線角度: {tgt_angle:.4f}°  回転補正: {rot_angle:+.4f}°")
         print(f"  平行移動: dx={dx:+.2f}px  dy={dy:+.2f}px")
-        print(f"  一致率(NCC): 補正前 {ncc_before:.5f} → 粗補正 {ncc_coarse:.5f}"
-              f" → 精密補正 {ncc_final:.5f}"
+        print(f"  キズ部一致率: 補正前 {sncc_before:.5f} → 粗補正 {sncc_coarse:.5f}"
+              f" → 精密補正 {sncc_final:.5f}"
               f"{'' if ecc_used else '（ECC不採用/失敗のため粗補正を使用）'}")
+        print(f"  全体一致率:   補正前 {ncc_before:.5f} → 補正後 {ncc_final:.5f}")
     return img_final, info
 
 
@@ -284,10 +332,10 @@ def main():
 
     print("=== サマリー ===")
     print(f"{'ファイル':<12} {'回転(deg)':>10} {'dx(px)':>9} {'dy(px)':>9} "
-          f"{'NCC補正前':>10} {'NCC補正後':>10}")
+          f"{'キズ部NCC':>10} {'全体NCC':>10}")
     for r in results:
         print(f"{r['file']:<12} {r['rot']:>+10.4f} {r['dx']:>+9.2f} {r['dy']:>+9.2f} "
-              f"{r['ncc_before']:>10.5f} {r['ncc_final']:>10.5f}")
+              f"{r['sncc_final']:>10.5f} {r['ncc_final']:>10.5f}")
 
 
 if __name__ == "__main__":
