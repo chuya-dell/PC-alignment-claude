@@ -11,29 +11,23 @@ Googleのサーバー上で動くトリガーなので、remotefdtd PCの電源�
 
 ローカルのrobocopy常駐と併用して構わない（どちらも上書きのみ・削除なし）。
 
-## 前提
+## 前提（設定済み・確認済み）
 
 - 移動先: chuya2816@gmail.com が所有する
   `1.実験データ_gdrive/5.生データ D`（フォルダID: `19XM79gcw2sV-7R74wDco3Pkgu-IPig0v`）
-- 移動元: remotefdtd PCのI:ドライブにマウントされているアカウントの
-  `データ移動` フォルダ（そのアカウントのメールアドレスを確認しておく）
+- 移動元: `remotefdtd@gmail.com` 所有の `データ移動` フォルダ
+  （フォルダID: `1lJyOa1TciJbSdjz6DWCjUPSkzRWdX3rm`。chuya2816@gmail.comに
+  共有済み・`Code.gs`にも設定済み）
 
-## セットアップ手順
+## セットアップ手順（残りはこれだけ）
 
-1. **共有設定**: 移動元アカウント（remotefdtdのI:アカウント）で
-   `データ移動` フォルダを右クリック →「共有」→ `chuya2816@gmail.com` を
-   **閲覧者**として追加する
-2. 共有後、chuya2816@gmail.com側のDriveで「データ移動」フォルダを開き、
-   URL中のID（`https://drive.google.com/drive/folders/<ここがID>`）を控える
-3. [script.google.com](https://script.google.com) に **chuya2816@gmail.com** で
+1. [script.google.com](https://script.google.com) に **chuya2816@gmail.com** で
    ログインし、新しいプロジェクトを作成
-4. `Code.gs` の内容をエディタに貼り付ける
-5. 左メニューの「サービス」（+ボタン）から **Drive API**
+2. `Code.gs` の内容をそのままエディタに貼り付ける（IDは設定済みなので
+   書き換え不要）
+3. 左メニューの「サービス」（+ボタン）から **Drive API**
    （Advanced Drive Service）を追加する
-6. コード冒頭の設定を書き換える
-   - `SOURCE_FOLDER_ID` → 手順2で控えたID
-   - `DEST_FOLDER_ID` → 既に `19XM79gcw2sV-7R74wDco3Pkgu-IPig0v` を設定済み
-7. 関数選択で `createTimeTrigger` を選び、一度だけ手動実行する
+4. 関数選択で `createTimeTrigger` を選び、一度だけ手動実行する
    - 初回は権限承認のダイアログが出るので許可する
    - これで5分おきの時間主導トリガーが設置され、以降は自動実行される
 

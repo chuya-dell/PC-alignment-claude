@@ -19,7 +19,7 @@
  */
 
 // ==== 設定 ====
-const SOURCE_FOLDER_ID = 'PUT_SOURCE_FOLDER_ID_HERE'; // remotefdtd側「データ移動」フォルダ（共有後のID）
+const SOURCE_FOLDER_ID = '1lJyOa1TciJbSdjz6DWCjUPSkzRWdX3rm'; // remotefdtd@gmail.com の「データ移動」フォルダ（chuya2816に共有済み）
 const DEST_FOLDER_ID = '19XM79gcw2sV-7R74wDco3Pkgu-IPig0v'; // chuya2816「1.実験データ_gdrive/5.生データ D」
 const SYNC_INTERVAL_MINUTES = 5; // 変更検知〜同期のインターバル
 const LOG_FILE_NAME = 'sync_log_gas.txt';
