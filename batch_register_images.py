@@ -99,57 +99,74 @@ def _subpixel_min(profile: np.ndarray, idx: int) -> float:
     return float(idx)
 
 
-def _prominence_scale(sub_profile: np.ndarray) -> tuple:
-    """探索範囲内の頑健な中心(中央値)とばらつき(MAD, 正規分布換算)を返す。
-    中央値絶対偏差(MAD)は少数の極値(=傷そのもの)に影響されにくいため、
-    周期的なピラー構造や順序統計量の影響を受けにくいプロミネンス基準になる。"""
-    eps = 1e-6
-    median = np.median(sub_profile)
-    mad = np.median(np.abs(sub_profile - median)) * 1.4826 + eps
-    return float(median), float(mad)
+def _smooth_rows(m: np.ndarray, k: int) -> np.ndarray:
+    kern = np.ones(k) / k
+    return np.apply_along_axis(lambda v: np.convolve(v, kern, mode="same"), 1, m)
 
 
-def _find_profile_extremum(band: np.ndarray, axis: int, smooth_window: int,
-                           edge_margin: int, polarity: str = "auto") -> tuple:
+def _trace_line(band: np.ndarray, line_axis: int, polarity: str,
+                edge_margin: int, smooth_window: int, tol: float) -> dict:
     """
-    band を axis 方向に平均化してプロファイル化し、移動平均で平滑化した後、
-    傷ランドマークの極値位置(サブピクセル)・プロミネンス・検出極性を返す。
+    帯域を「線が走る方向 × 探索方向」に整え、各スライスで極値位置を追跡して
+    傷ランドマーク線を頑健に同定する(帯域平均法と違い、波打ち・傾きに強い)。
 
-    polarity:
-      - "dark"  : 暗い線(プロファイル最小値)。明視野系/従来データ向け。
-      - "bright": 明るい線(プロファイル最大値)。暗視野散乱像では傷が明るく写るため。
-      - "auto"  : 暗側・明側の両プロミネンスを比べ、強い方を採用(既定)。
+    各スライスの極値位置に2次多項式をフィットして波打ち/傾きを吸収し、
+    フィットからの残差が tol 以内に収まるスライスの割合(inlier率)を信頼度とする。
+    ランダムなノイズやピラー模様は極値位置が散らばるため inlier率が低くなり、
+    真の連続した傷だけが高い inlier率を示す。
 
-    np.convolve の mode='same' は端で暗黙的にゼロ相当のパディングを行い、端に
-    平滑化アーティファクト(見かけ上の谷/山)が出るため、両端 edge_margin を探索から除外する。
+    戻り値 dict:
+      position   : 帯域中央での線位置(探索方向, サブ帯域オフセット込みの相対値)
+      confidence : inlier率(0..1)
+      contrast_snr: 線コントラストのノイズ比(帯域外の弱い勾配で誤検出しない担保)
+      waviness   : フィット位置の振れ幅(px, 波打ち量の目安)
+      polarity   : 採用した極性
     """
-    profile = np.mean(band, axis=axis)
-    smooth = np.convolve(profile, np.ones(smooth_window) / smooth_window, mode="same")
+    m = band if line_axis == 0 else band.T  # 常に「行方向に線が走る」向きへ
+    N, M = m.shape
+    ms = _smooth_rows(m, smooth_window)
+    margin = min(edge_margin, (M - 1) // 2)
+    lo, hi = margin, M - margin
+    sub = ms[:, lo:hi]
+    row_med = np.median(sub, axis=1)
 
-    margin = min(edge_margin, (len(smooth) - 1) // 2)
-    lo, hi = margin, len(smooth) - margin
-    sub = smooth[lo:hi]
-    median, mad = _prominence_scale(sub)
+    if polarity == "bright":
+        pos = lo + np.argmax(sub, axis=1).astype(np.float64)
+        contrast = np.max(sub, axis=1) - row_med
+    else:
+        pos = lo + np.argmin(sub, axis=1).astype(np.float64)
+        contrast = row_med - np.min(sub, axis=1)
 
-    min_idx = int(np.argmin(sub))
-    dark_prom = (median - sub[min_idx]) / mad
-    max_idx = int(np.argmax(sub))
-    bright_prom = (sub[max_idx] - median) / mad
+    idx = np.arange(N)
+    good = contrast > np.median(contrast)  # コントラストのある行だけで線形状を推定
+    result = {"position": float(np.median(pos)), "confidence": 0.0,
+              "contrast_snr": 0.0, "waviness": float(np.std(pos)), "polarity": polarity}
+    if good.sum() < max(5, int(N * 0.1)):
+        return result
 
-    if polarity == "dark":
-        local_idx, prom, pol = min_idx, dark_prom, "dark"
-    elif polarity == "bright":
-        local_idx, prom, pol = max_idx, bright_prom, "bright"
-    else:  # auto: 強い方を採用
-        if bright_prom >= dark_prom:
-            local_idx, prom, pol = max_idx, bright_prom, "bright"
-        else:
-            local_idx, prom, pol = min_idx, dark_prom, "dark"
+    coeffs = np.polyfit(idx[good], pos[good], 2)
+    fit = np.polyval(coeffs, idx)
+    inlier = np.abs(pos - fit) <= tol
+    noise = np.median(np.abs(sub - row_med[:, None])) * 1.4826 + 1e-6
+    med_contrast = np.median(contrast[inlier]) if inlier.any() else 0.0
 
-    idx = lo + local_idx
-    # 放物線頂点補間は極小・極大どちらの頂点位置も同式で求まる
-    position = _subpixel_min(smooth, idx)
-    return position, float(prom), pol
+    result["confidence"] = float(np.mean(inlier))
+    result["contrast_snr"] = float(med_contrast / noise)
+    result["waviness"] = float(np.std(fit))
+    result["position"] = float(np.polyval(coeffs, N / 2.0))
+    return result
+
+
+def _detect_line(band: np.ndarray, line_axis: int, polarity: str,
+                 edge_margin: int, smooth_window: int, tol: float) -> dict:
+    """polarity=auto なら明/暗を両方追跡し inlier率(同点はコントラスト)の高い方を採用。"""
+    if polarity in ("bright", "dark"):
+        return _trace_line(band, line_axis, polarity, edge_margin, smooth_window, tol)
+    rb = _trace_line(band, line_axis, "bright", edge_margin, smooth_window, tol)
+    rd = _trace_line(band, line_axis, "dark", edge_margin, smooth_window, tol)
+    kb = (rb["confidence"], rb["contrast_snr"])
+    kd = (rd["confidence"], rd["contrast_snr"])
+    return rb if kb >= kd else rd
 
 
 def detect_scratch_landmark(
@@ -161,36 +178,42 @@ def detect_scratch_landmark(
     smooth_window: int = 15,
     edge_margin: int = 30,
     polarity: str = "auto",
+    trace_tol: float = 6.0,
 ) -> dict:
     """
     デザインナイフ傷(縦線・横線)のランドマーク座標を検出する。
-    detect_grooves (registration.py) と同じ「プロファイル極値+移動平均平滑化」方式。
+    detect_grooves (registration.py) の考え方を踏襲しつつ、帯域平均ではなく
+    各スライスの極値位置を追跡する頑健な方式(波打ち・傾きに強い)を用いる。
     polarity で暗い傷(明視野)/明るい傷(暗視野散乱像)/自動判別を切り替える。
+    信頼度は inlier率(0..1)。
     """
     h, w = img.shape[:2]
     r0, r1 = max(0, v_row_band[0]), min(h, v_row_band[1])
     c0, c1 = max(0, v_col_range[0]), min(w, v_col_range[1])
     v_band = img[r0:r1, c0:c1].astype(np.float64)
-    x_local, prom_x, pol_x = _find_profile_extremum(
-        v_band, axis=0, smooth_window=smooth_window, edge_margin=edge_margin, polarity=polarity)
-    scratch_x = c0 + x_local
+    v = _detect_line(v_band, line_axis=0, polarity=polarity,
+                     edge_margin=edge_margin, smooth_window=smooth_window, tol=trace_tol)
+    scratch_x = c0 + v["position"]
 
     rr0, rr1 = max(0, h_row_range[0]), min(h, h_row_range[1])
     cc0, cc1 = max(0, h_col_band[0]), min(w, h_col_band[1])
     h_band = img[rr0:rr1, cc0:cc1].astype(np.float64)
-    y_local, prom_y, pol_y = _find_profile_extremum(
-        h_band, axis=1, smooth_window=smooth_window, edge_margin=edge_margin, polarity=polarity)
-    scratch_y = rr0 + y_local
+    hln = _detect_line(h_band, line_axis=1, polarity=polarity,
+                       edge_margin=edge_margin, smooth_window=smooth_window, tol=trace_tol)
+    scratch_y = rr0 + hln["position"]
 
-    return {"x": scratch_x, "y": scratch_y, "prominence_x": prom_x, "prominence_y": prom_y,
-            "polarity_x": pol_x, "polarity_y": pol_y}
+    return {"x": scratch_x, "y": scratch_y,
+            "confidence_x": v["confidence"], "confidence_y": hln["confidence"],
+            "contrast_x": v["contrast_snr"], "contrast_y": hln["contrast_snr"],
+            "polarity_x": v["polarity"], "polarity_y": hln["polarity"],
+            "waviness_x": v["waviness"], "waviness_y": hln["waviness"]}
 
 
 # ===================== 位置合わせ (phaseCorrelate -> ECC) =====================
 
 @dataclass
 class RegistrationResult:
-    status: str  # "ok" / "scratch_not_detected" / "ecc_not_converged"
+    status: str  # "ok" / "scratch_not_detected" / "scratch_crop_too_small" / ...
     scratch_detected_pre: bool = False
     scratch_detected_post: bool = False
     dx: float = float("nan")
@@ -199,27 +222,32 @@ class RegistrationResult:
     warp_matrix: Optional[np.ndarray] = None
     scratch_xy_pre: Optional[tuple] = None
     scratch_xy_post: Optional[tuple] = None
-    prominence_pre: float = float("nan")   # min(prominence_x, prominence_y) of pre
-    prominence_post: float = float("nan")
+    confidence_pre: float = float("nan")   # min(confidence_x, confidence_y) of pre
+    confidence_post: float = float("nan")
     polarity: str = ""
+    mode: str = ""  # "ecc" / "translation_fallback"
 
 
 def register_pair(
     pre_img: np.ndarray,
     post_img: np.ndarray,
     scratch_kwargs: dict,
-    min_prominence: float,
+    min_confidence: float,
     crop_margin: int,
     ecc_eps: float,
     ecc_iterations: int,
+    min_contrast: float = 2.0,
 ) -> RegistrationResult:
     h, w = pre_img.shape[:2]
 
     pre_lm = detect_scratch_landmark(pre_img, **scratch_kwargs)
     post_lm = detect_scratch_landmark(post_img, **scratch_kwargs)
 
-    pre_ok = pre_lm["prominence_x"] >= min_prominence and pre_lm["prominence_y"] >= min_prominence
-    post_ok = post_lm["prominence_x"] >= min_prominence and post_lm["prominence_y"] >= min_prominence
+    def _ok(lm):
+        return (lm["confidence_x"] >= min_confidence and lm["confidence_y"] >= min_confidence
+                and lm["contrast_x"] >= min_contrast and lm["contrast_y"] >= min_contrast)
+
+    pre_ok, post_ok = _ok(pre_lm), _ok(post_lm)
 
     result = RegistrationResult(
         status="ok",
@@ -227,14 +255,18 @@ def register_pair(
         scratch_detected_post=post_ok,
         scratch_xy_pre=(pre_lm["x"], pre_lm["y"]),
         scratch_xy_post=(post_lm["x"], post_lm["y"]),
-        prominence_pre=min(pre_lm["prominence_x"], pre_lm["prominence_y"]),
-        prominence_post=min(post_lm["prominence_x"], post_lm["prominence_y"]),
+        confidence_pre=min(pre_lm["confidence_x"], pre_lm["confidence_y"]),
+        confidence_post=min(post_lm["confidence_x"], post_lm["confidence_y"]),
         polarity=f"{pre_lm['polarity_x']}/{pre_lm['polarity_y']}",
     )
 
     if not (pre_ok and post_ok):
         result.status = "scratch_not_detected"
         return result
+
+    # 傷位置から直接得られる粗い並進(ECC失敗時のフォールバックにも使う)。
+    # M(pre->post)の並進成分 = post傷位置 - pre傷位置。
+    dxy_coarse = np.array([post_lm["x"] - pre_lm["x"], post_lm["y"] - pre_lm["y"]], dtype=np.float64)
 
     # 傷ランドマーク周辺の同一座標範囲(pre基準)を pre/post 双方から切り出す。
     px, py = pre_lm["x"], pre_lm["y"]
@@ -250,14 +282,28 @@ def register_pair(
     pre_crop = pre_img[y0:y1, x0:x1].astype(np.float32)
     post_crop = post_img[y0:y1, x0:x1].astype(np.float32)
 
-    # 1. phaseCorrelate で並進の初期値を推定
+    def _finalize(R, t_global, mode):
+        M_global = np.zeros((2, 3), dtype=np.float64)
+        M_global[:, :2] = R
+        M_global[:, 2] = t_global
+        result.warp_matrix = M_global
+        result.dx = float(t_global[0])
+        result.dy = float(t_global[1])
+        result.rotation_deg = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
+        result.mode = mode
+        return result
+
+    def _translation_fallback():
+        # 傷位置から得た並進のみで位置合わせ(回転なし)。ECCが使えない場合の保険。
+        return _finalize(np.eye(2), dxy_coarse, "translation_fallback")
+
+    # 1. phaseCorrelate で並進初期値(傷位置ベースの粗並進を初期値に足す)
     hann = cv2.createHanningWindow((pre_crop.shape[1], pre_crop.shape[0]), cv2.CV_32F)
     try:
         (shift_x, shift_y), _response = cv2.phaseCorrelate(pre_crop, post_crop, hann)
     except cv2.error as exc:
-        logger.warning("phaseCorrelate 失敗: %s", exc)
-        result.status = "phase_correlate_failed"
-        return result
+        logger.warning("phaseCorrelate 失敗(傷位置ベースの並進にフォールバック): %s", exc)
+        return _translation_fallback()
 
     warp_matrix = np.array([[1, 0, shift_x], [0, 1, shift_y]], dtype=np.float32)
 
@@ -267,10 +313,10 @@ def register_pair(
         _cc, warp_matrix = cv2.findTransformECC(
             pre_crop, post_crop, warp_matrix, cv2.MOTION_EUCLIDEAN, criteria
         )
-    except cv2.error as exc:
-        logger.warning("findTransformECC が収束しませんでした: %s", exc)
-        result.status = "ecc_not_converged"
-        return result
+    except cv2.error:
+        # ECC非収束: 傷位置ベースの並進のみで確定(スキップせず処理継続)
+        logger.info("findTransformECC 非収束のため傷位置ベースの並進で位置合わせします。")
+        return _translation_fallback()
 
     # pre_crop / post_crop は同一オフセット(x0, y0)で切り出しているため、
     # クロップ座標系の変換行列をそのまま画像全体の座標系へ変換できる。
@@ -278,16 +324,7 @@ def register_pair(
     t_local = warp_matrix[:, 2].astype(np.float64)
     offset = np.array([x0, y0], dtype=np.float64)
     t_global = t_local + offset - R @ offset
-
-    M_global = np.zeros((2, 3), dtype=np.float64)
-    M_global[:, :2] = R
-    M_global[:, 2] = t_global
-
-    result.warp_matrix = M_global
-    result.dx = float(t_global[0])
-    result.dy = float(t_global[1])
-    result.rotation_deg = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
-    return result
+    return _finalize(R, t_global, "ecc")
 
 
 def apply_warp(post_img: np.ndarray, warp_matrix: np.ndarray) -> tuple:
@@ -554,8 +591,9 @@ def process_group(label, key: GroupKey, files: dict, args, output_dir: Path):
             "dx_px": float("nan"),
             "dy_px": float("nan"),
             "rotation_deg": float("nan"),
-            "scratch_prominence_pre": float("nan"),
-            "scratch_prominence_post": float("nan"),
+            "registration_mode": "",
+            "scratch_confidence_pre": float("nan"),
+            "scratch_confidence_post": float("nan"),
             "scratch_polarity": "",
             "scratch_ncc": float("nan"),
             "scratch_match_rate_pct": float("nan"),
@@ -581,28 +619,33 @@ def process_group(label, key: GroupKey, files: dict, args, output_dir: Path):
 
         reg = register_pair(
             pre_img, post_img, scratch_kwargs,
-            min_prominence=args.scratch_min_prominence,
+            min_confidence=args.scratch_min_confidence,
             crop_margin=args.scratch_crop_margin,
             ecc_eps=args.ecc_eps,
             ecc_iterations=args.ecc_iterations,
+            min_contrast=args.scratch_min_contrast,
         )
 
         row["scratch_detected_pre"] = reg.scratch_detected_pre
         row["scratch_detected_post"] = reg.scratch_detected_post
-        row["scratch_prominence_pre"] = reg.prominence_pre
-        row["scratch_prominence_post"] = reg.prominence_post
+        row["scratch_confidence_pre"] = reg.confidence_pre
+        row["scratch_confidence_post"] = reg.confidence_post
         row["scratch_polarity"] = reg.polarity
+        row["registration_mode"] = reg.mode
 
         if reg.status != "ok":
             logger.warning(
-                "[%s] 位置合わせ失敗 (%s): %s。傷プロミネンス pre=%.1f post=%.1f (閾値%.1f, 極性%s)。"
-                "スキップして次へ進みます。",
+                "[%s] 位置合わせ失敗 (%s): %s。傷検出信頼度(inlier率) pre=%.2f post=%.2f "
+                "(閾値%.2f, 極性%s)。スキップして次へ進みます。",
                 label, reg.status, post_path.name,
-                reg.prominence_pre, reg.prominence_post, args.scratch_min_prominence, reg.polarity or "?",
+                reg.confidence_pre, reg.confidence_post, args.scratch_min_confidence, reg.polarity or "?",
             )
             row["status"] = reg.status
             rows.append(row)
             continue
+
+        if reg.mode == "translation_fallback":
+            logger.info("[%s] %s は傷位置ベースの並進のみで位置合わせ(ECC非収束)。", label, post_path.name)
 
         row["dx_px"] = reg.dx
         row["dy_px"] = reg.dy
@@ -727,8 +770,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--scratch-crop-margin", type=int, default=250,
                          help="傷ランドマーク周辺の位置合わせ用切り出し半幅(px, 既定250)")
-    parser.add_argument("--scratch-min-prominence", type=float, default=8.0,
-                         help="傷検出とみなす最小プロミネンス(既定8.0)")
+    parser.add_argument("--scratch-min-confidence", type=float, default=0.5,
+                         help="傷検出とみなす最小信頼度=inlier率(0..1, 既定0.5)。"
+                              "各スライスの極値位置が線状にそろっている割合")
+    parser.add_argument("--scratch-min-contrast", type=float, default=2.0,
+                         help="傷とみなす最小コントラストSNR(既定2.0)。弱い勾配での誤検出防止")
     parser.add_argument("--scratch-polarity", type=str, default="auto",
                          choices=["auto", "bright", "dark"],
                          help="傷の極性: bright=明るい線(暗視野散乱像) / dark=暗い線(明視野) / "
