@@ -99,29 +99,29 @@ def _subpixel_min(profile: np.ndarray, idx: int) -> float:
     return float(idx)
 
 
-def _prominence(sub_profile: np.ndarray, local_idx: int) -> float:
-    """
-    プロファイル最小値の「深さ」を、同じ探索範囲内の頑健なばらつき指標(MAD)に対する
-    比で評価する。argmin は常にその範囲内で最も低い値を選ぶため、通常の標準偏差や
-    生画素の標準偏差を分母にすると、周期的なピラー構造由来の分散混入や、多数サンプル
-    からの極値選択(順序統計量)の影響で、真の傷が無くても高いスコアが出やすい。
-    中央値絶対偏差(MAD)は少数の極値(=最小点そのもの)に影響されにくく、
-    「大多数の点から見て、その谷がどれだけ際立っているか」を頑健に測れる。
-    """
+def _prominence_scale(sub_profile: np.ndarray) -> tuple:
+    """探索範囲内の頑健な中心(中央値)とばらつき(MAD, 正規分布換算)を返す。
+    中央値絶対偏差(MAD)は少数の極値(=傷そのもの)に影響されにくいため、
+    周期的なピラー構造や順序統計量の影響を受けにくいプロミネンス基準になる。"""
     eps = 1e-6
     median = np.median(sub_profile)
-    mad = np.median(np.abs(sub_profile - median)) * 1.4826  # 正規分布換算の標準偏差相当
-    depth = median - sub_profile[local_idx]
-    return float(depth / (mad + eps))
+    mad = np.median(np.abs(sub_profile - median)) * 1.4826 + eps
+    return float(median), float(mad)
 
 
-def _find_profile_min(band: np.ndarray, axis: int, smooth_window: int, edge_margin: int) -> tuple:
+def _find_profile_extremum(band: np.ndarray, axis: int, smooth_window: int,
+                           edge_margin: int, polarity: str = "auto") -> tuple:
     """
     band を axis 方向に平均化してプロファイル化し、移動平均で平滑化した後、
-    最小値の位置(サブピクセル)とプロミネンスを求める。
-    np.convolve の mode='same' は端で暗黙的にゼロ相当のパディングを行うため、
-    プロファイル端に平滑化アーティファクト(見かけ上の谷)が生じる。
-    detect_grooves (registration.py) 同様、両端 edge_margin 分を探索範囲から除外する。
+    傷ランドマークの極値位置(サブピクセル)・プロミネンス・検出極性を返す。
+
+    polarity:
+      - "dark"  : 暗い線(プロファイル最小値)。明視野系/従来データ向け。
+      - "bright": 明るい線(プロファイル最大値)。暗視野散乱像では傷が明るく写るため。
+      - "auto"  : 暗側・明側の両プロミネンスを比べ、強い方を採用(既定)。
+
+    np.convolve の mode='same' は端で暗黙的にゼロ相当のパディングを行い、端に
+    平滑化アーティファクト(見かけ上の谷/山)が出るため、両端 edge_margin を探索から除外する。
     """
     profile = np.mean(band, axis=axis)
     smooth = np.convolve(profile, np.ones(smooth_window) / smooth_window, mode="same")
@@ -129,12 +129,27 @@ def _find_profile_min(band: np.ndarray, axis: int, smooth_window: int, edge_marg
     margin = min(edge_margin, (len(smooth) - 1) // 2)
     lo, hi = margin, len(smooth) - margin
     sub = smooth[lo:hi]
-    local_idx = int(np.argmin(sub))
-    idx = lo + local_idx
+    median, mad = _prominence_scale(sub)
 
+    min_idx = int(np.argmin(sub))
+    dark_prom = (median - sub[min_idx]) / mad
+    max_idx = int(np.argmax(sub))
+    bright_prom = (sub[max_idx] - median) / mad
+
+    if polarity == "dark":
+        local_idx, prom, pol = min_idx, dark_prom, "dark"
+    elif polarity == "bright":
+        local_idx, prom, pol = max_idx, bright_prom, "bright"
+    else:  # auto: 強い方を採用
+        if bright_prom >= dark_prom:
+            local_idx, prom, pol = max_idx, bright_prom, "bright"
+        else:
+            local_idx, prom, pol = min_idx, dark_prom, "dark"
+
+    idx = lo + local_idx
+    # 放物線頂点補間は極小・極大どちらの頂点位置も同式で求まる
     position = _subpixel_min(smooth, idx)
-    prom = _prominence(sub, local_idx)
-    return position, prom
+    return position, float(prom), pol
 
 
 def detect_scratch_landmark(
@@ -145,25 +160,30 @@ def detect_scratch_landmark(
     h_col_band=DEFAULT_H_COL_BAND,
     smooth_window: int = 15,
     edge_margin: int = 30,
+    polarity: str = "auto",
 ) -> dict:
     """
     デザインナイフ傷(縦線・横線)のランドマーク座標を検出する。
-    detect_grooves (registration.py) と同じ「プロファイル最小値+移動平均平滑化」方式。
+    detect_grooves (registration.py) と同じ「プロファイル極値+移動平均平滑化」方式。
+    polarity で暗い傷(明視野)/明るい傷(暗視野散乱像)/自動判別を切り替える。
     """
     h, w = img.shape[:2]
     r0, r1 = max(0, v_row_band[0]), min(h, v_row_band[1])
     c0, c1 = max(0, v_col_range[0]), min(w, v_col_range[1])
     v_band = img[r0:r1, c0:c1].astype(np.float64)
-    x_local, prom_x = _find_profile_min(v_band, axis=0, smooth_window=smooth_window, edge_margin=edge_margin)
+    x_local, prom_x, pol_x = _find_profile_extremum(
+        v_band, axis=0, smooth_window=smooth_window, edge_margin=edge_margin, polarity=polarity)
     scratch_x = c0 + x_local
 
     rr0, rr1 = max(0, h_row_range[0]), min(h, h_row_range[1])
     cc0, cc1 = max(0, h_col_band[0]), min(w, h_col_band[1])
     h_band = img[rr0:rr1, cc0:cc1].astype(np.float64)
-    y_local, prom_y = _find_profile_min(h_band, axis=1, smooth_window=smooth_window, edge_margin=edge_margin)
+    y_local, prom_y, pol_y = _find_profile_extremum(
+        h_band, axis=1, smooth_window=smooth_window, edge_margin=edge_margin, polarity=polarity)
     scratch_y = rr0 + y_local
 
-    return {"x": scratch_x, "y": scratch_y, "prominence_x": prom_x, "prominence_y": prom_y}
+    return {"x": scratch_x, "y": scratch_y, "prominence_x": prom_x, "prominence_y": prom_y,
+            "polarity_x": pol_x, "polarity_y": pol_y}
 
 
 # ===================== 位置合わせ (phaseCorrelate -> ECC) =====================
@@ -179,6 +199,9 @@ class RegistrationResult:
     warp_matrix: Optional[np.ndarray] = None
     scratch_xy_pre: Optional[tuple] = None
     scratch_xy_post: Optional[tuple] = None
+    prominence_pre: float = float("nan")   # min(prominence_x, prominence_y) of pre
+    prominence_post: float = float("nan")
+    polarity: str = ""
 
 
 def register_pair(
@@ -204,6 +227,9 @@ def register_pair(
         scratch_detected_post=post_ok,
         scratch_xy_pre=(pre_lm["x"], pre_lm["y"]),
         scratch_xy_post=(post_lm["x"], post_lm["y"]),
+        prominence_pre=min(pre_lm["prominence_x"], pre_lm["prominence_y"]),
+        prominence_post=min(post_lm["prominence_x"], post_lm["prominence_y"]),
+        polarity=f"{pre_lm['polarity_x']}/{pre_lm['polarity_y']}",
     )
 
     if not (pre_ok and post_ok):
@@ -505,6 +531,7 @@ def process_group(label, key: GroupKey, files: dict, args, output_dir: Path):
         v_row_band=args.v_row_band,
         h_row_range=args.h_row_range,
         h_col_band=args.h_col_band,
+        polarity=args.scratch_polarity,
     )
 
     other_seqs = sorted(k for k in files if k != 0)
@@ -527,6 +554,9 @@ def process_group(label, key: GroupKey, files: dict, args, output_dir: Path):
             "dx_px": float("nan"),
             "dy_px": float("nan"),
             "rotation_deg": float("nan"),
+            "scratch_prominence_pre": float("nan"),
+            "scratch_prominence_post": float("nan"),
+            "scratch_polarity": "",
             "scratch_ncc": float("nan"),
             "scratch_match_rate_pct": float("nan"),
             "n_pillar_patches": 0,
@@ -559,11 +589,16 @@ def process_group(label, key: GroupKey, files: dict, args, output_dir: Path):
 
         row["scratch_detected_pre"] = reg.scratch_detected_pre
         row["scratch_detected_post"] = reg.scratch_detected_post
+        row["scratch_prominence_pre"] = reg.prominence_pre
+        row["scratch_prominence_post"] = reg.prominence_post
+        row["scratch_polarity"] = reg.polarity
 
         if reg.status != "ok":
             logger.warning(
-                "[%s] 位置合わせ失敗 (%s): %s のスクラッチ検出/ECCに問題があります。スキップして次へ進みます。",
+                "[%s] 位置合わせ失敗 (%s): %s。傷プロミネンス pre=%.1f post=%.1f (閾値%.1f, 極性%s)。"
+                "スキップして次へ進みます。",
                 label, reg.status, post_path.name,
+                reg.prominence_pre, reg.prominence_post, args.scratch_min_prominence, reg.polarity or "?",
             )
             row["status"] = reg.status
             rows.append(row)
@@ -694,6 +729,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          help="傷ランドマーク周辺の位置合わせ用切り出し半幅(px, 既定250)")
     parser.add_argument("--scratch-min-prominence", type=float, default=8.0,
                          help="傷検出とみなす最小プロミネンス(既定8.0)")
+    parser.add_argument("--scratch-polarity", type=str, default="auto",
+                         choices=["auto", "bright", "dark"],
+                         help="傷の極性: bright=明るい線(暗視野散乱像) / dark=暗い線(明視野) / "
+                              "auto=強い方を自動判別(既定)")
     parser.add_argument("--match-threshold", type=float, default=5.0,
                          help="一致率判定の許容階調差 |Δ|<=threshold (既定5)")
     parser.add_argument("--ecc-iterations", type=int, default=200, help="findTransformECC 最大反復回数")
