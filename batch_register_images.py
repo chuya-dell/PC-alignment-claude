@@ -40,12 +40,15 @@ logger = logging.getLogger("batch_register")
 
 IMAGE_SUFFIXES = {".tif", ".tiff"}
 
-# 傷(スクラッチ)ランドマーク検出のデフォルト探索帯域。
-# registration.py の detect_grooves を参考にした値であり、CLI引数で上書き可能。
-DEFAULT_V_COL_RANGE = (0, 300)
-DEFAULT_V_ROW_BAND = (500, 1500)
-DEFAULT_H_ROW_RANGE = (0, 300)
-DEFAULT_H_COL_BAND = (1000, 1900)
+# 傷(スクラッチ)ランドマーク検出の探索範囲。
+# 位置合わせテストでは同じ傷十字が視野ごとに異なる位置に写るため、既定は
+# 画像全体(None=フルフレーム)を探索する。CLI引数で範囲を絞ることも可能。
+#   V*: 縦傷 → 列(v_col_range)を探索し、行(v_row_band)方向に追跡
+#   H*: 横傷 → 行(h_row_range)を探索し、列(h_col_band)方向に追跡
+DEFAULT_V_COL_RANGE = None
+DEFAULT_V_ROW_BAND = None
+DEFAULT_H_ROW_RANGE = None
+DEFAULT_H_COL_BAND = None
 
 
 # ===================== ファイルグルーピング =====================
@@ -107,20 +110,22 @@ def _smooth_rows(m: np.ndarray, k: int) -> np.ndarray:
 def _trace_line(band: np.ndarray, line_axis: int, polarity: str,
                 edge_margin: int, smooth_window: int, tol: float) -> dict:
     """
-    帯域を「線が走る方向 × 探索方向」に整え、各スライスで極値位置を追跡して
-    傷ランドマーク線を頑健に同定する(帯域平均法と違い、波打ち・傾きに強い)。
+    フルフレーム探索で傷ランドマーク線を頑健に同定する。
+    帯域を「線が走る方向(行) × 探索方向(列)」に整え、各行で極値位置を取り、
+    その位置の1次元モード(幅2*tolの窓に最も多く入る位置=支配的な線)を求める。
 
-    各スライスの極値位置に2次多項式をフィットして波打ち/傾きを吸収し、
-    フィットからの残差が tol 以内に収まるスライスの割合(inlier率)を信頼度とする。
-    ランダムなノイズやピラー模様は極値位置が散らばるため inlier率が低くなり、
-    真の連続した傷だけが高い inlier率を示す。
+    傷は視野ごとに任意の位置に写る(位置合わせテスト)ため、固定帯域ではなく
+    全幅から線を探す。線がフレームの一部しか横切らなくても、支配的なクラスタの
+    投票数/全行 で信頼度が下がるだけで位置は正しく取れる。ランダム/ピラー模様は
+    極値位置が散らばるためモードの投票率が低い(≈2*tol/幅)。十字のもう一方の腕は
+    少数行にしか現れないため主たる線が勝つ。
 
     戻り値 dict:
-      position   : 帯域中央での線位置(探索方向, サブ帯域オフセット込みの相対値)
-      confidence : inlier率(0..1)
-      contrast_snr: 線コントラストのノイズ比(帯域外の弱い勾配で誤検出しない担保)
-      waviness   : フィット位置の振れ幅(px, 波打ち量の目安)
-      polarity   : 採用した極性
+      position   : 線位置(探索方向, band内オフセット込み相対値)
+      confidence : モード投票率(0..1) = 支配的な線上に極値が乗った行の割合
+      contrast_snr: 線コントラストのノイズ比(弱い勾配での誤検出防止)
+      waviness   : インライア位置の標準偏差(px, 波打ち量)
+      polarity   : 採用極性
     """
     m = band if line_axis == 0 else band.T  # 常に「行方向に線が走る」向きへ
     N, M = m.shape
@@ -131,29 +136,33 @@ def _trace_line(band: np.ndarray, line_axis: int, polarity: str,
     row_med = np.median(sub, axis=1)
 
     if polarity == "bright":
-        pos = lo + np.argmax(sub, axis=1).astype(np.float64)
+        pos = (lo + np.argmax(sub, axis=1)).astype(np.float64)
         contrast = np.max(sub, axis=1) - row_med
     else:
-        pos = lo + np.argmin(sub, axis=1).astype(np.float64)
+        pos = (lo + np.argmin(sub, axis=1)).astype(np.float64)
         contrast = row_med - np.min(sub, axis=1)
 
-    idx = np.arange(N)
-    good = contrast > np.median(contrast)  # コントラストのある行だけで線形状を推定
+    noise = np.median(np.abs(sub - row_med[:, None])) * 1.4826 + 1e-6
     result = {"position": float(np.median(pos)), "confidence": 0.0,
               "contrast_snr": 0.0, "waviness": float(np.std(pos)), "polarity": polarity}
-    if good.sum() < max(5, int(N * 0.1)):
+    if N < 10:
         return result
 
-    coeffs = np.polyfit(idx[good], pos[good], 2)
-    fit = np.polyval(coeffs, idx)
-    inlier = np.abs(pos - fit) <= tol
-    noise = np.median(np.abs(sub - row_med[:, None])) * 1.4826 + 1e-6
-    med_contrast = np.median(contrast[inlier]) if inlier.any() else 0.0
+    # 1次元モード: 幅 2*tol の窓に最も多くの行の極値位置が入る位置を探す
+    order = np.argsort(pos)
+    sp = pos[order]
+    right = np.searchsorted(sp, sp + 2.0 * tol, side="right")
+    counts = right - np.arange(len(sp))
+    bi = int(np.argmax(counts))
+    count = int(counts[bi])
+    win_lo, win_hi = sp[bi], sp[bi] + 2.0 * tol
+    inlier = (pos >= win_lo) & (pos <= win_hi)
 
-    result["confidence"] = float(np.mean(inlier))
+    result["confidence"] = float(count) / N
+    result["position"] = float(np.median(pos[inlier]))
+    result["waviness"] = float(np.std(pos[inlier])) if inlier.sum() > 1 else 0.0
+    med_contrast = np.median(contrast[inlier]) if inlier.any() else 0.0
     result["contrast_snr"] = float(med_contrast / noise)
-    result["waviness"] = float(np.std(fit))
-    result["position"] = float(np.polyval(coeffs, N / 2.0))
     return result
 
 
@@ -176,31 +185,35 @@ def detect_scratch_landmark(
     h_row_range=DEFAULT_H_ROW_RANGE,
     h_col_band=DEFAULT_H_COL_BAND,
     smooth_window: int = 15,
-    edge_margin: int = 30,
+    edge_margin: int = 8,
     polarity: str = "auto",
-    trace_tol: float = 6.0,
+    trace_tol: float = 20.0,
 ) -> dict:
     """
     デザインナイフ傷(縦線・横線)のランドマーク座標を検出する。
-    detect_grooves (registration.py) の考え方を踏襲しつつ、帯域平均ではなく
-    各スライスの極値位置を追跡する頑健な方式(波打ち・傾きに強い)を用いる。
-    polarity で暗い傷(明視野)/明るい傷(暗視野散乱像)/自動判別を切り替える。
-    信頼度は inlier率(0..1)。
+    位置合わせテストでは傷十字が視野ごとに任意位置に写るため、既定では
+    画像全体(範囲=None)から支配的な縦/横の明線(または暗線)を探す。
+    各範囲を明示指定すればその中に限定して探索できる。
+    polarity で暗い傷/明るい傷/自動判別を切替。信頼度はモード投票率(0..1)。
     """
     h, w = img.shape[:2]
-    r0, r1 = max(0, v_row_band[0]), min(h, v_row_band[1])
-    c0, c1 = max(0, v_col_range[0]), min(w, v_col_range[1])
-    v_band = img[r0:r1, c0:c1].astype(np.float64)
+    vc0, vc1 = v_col_range if v_col_range else (0, w)
+    vr0, vr1 = v_row_band if v_row_band else (0, h)
+    vc0, vc1 = max(0, vc0), min(w, vc1)
+    vr0, vr1 = max(0, vr0), min(h, vr1)
+    v_band = img[vr0:vr1, vc0:vc1].astype(np.float64)
     v = _detect_line(v_band, line_axis=0, polarity=polarity,
                      edge_margin=edge_margin, smooth_window=smooth_window, tol=trace_tol)
-    scratch_x = c0 + v["position"]
+    scratch_x = vc0 + v["position"]
 
-    rr0, rr1 = max(0, h_row_range[0]), min(h, h_row_range[1])
-    cc0, cc1 = max(0, h_col_band[0]), min(w, h_col_band[1])
-    h_band = img[rr0:rr1, cc0:cc1].astype(np.float64)
+    hr0, hr1 = h_row_range if h_row_range else (0, h)
+    hc0, hc1 = h_col_band if h_col_band else (0, w)
+    hr0, hr1 = max(0, hr0), min(h, hr1)
+    hc0, hc1 = max(0, hc0), min(w, hc1)
+    h_band = img[hr0:hr1, hc0:hc1].astype(np.float64)
     hln = _detect_line(h_band, line_axis=1, polarity=polarity,
                        edge_margin=edge_margin, smooth_window=smooth_window, tol=trace_tol)
-    scratch_y = rr0 + hln["position"]
+    scratch_y = hr0 + hln["position"]
 
     return {"x": scratch_x, "y": scratch_y,
             "confidence_x": v["confidence"], "confidence_y": hln["confidence"],
@@ -569,6 +582,7 @@ def process_group(label, key: GroupKey, files: dict, args, output_dir: Path):
         h_row_range=args.h_row_range,
         h_col_band=args.h_col_band,
         polarity=args.scratch_polarity,
+        trace_tol=args.scratch_trace_tol,
     )
 
     other_seqs = sorted(k for k in files if k != 0)
@@ -770,11 +784,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--scratch-crop-margin", type=int, default=250,
                          help="傷ランドマーク周辺の位置合わせ用切り出し半幅(px, 既定250)")
-    parser.add_argument("--scratch-min-confidence", type=float, default=0.5,
-                         help="傷検出とみなす最小信頼度=inlier率(0..1, 既定0.5)。"
-                              "各スライスの極値位置が線状にそろっている割合")
+    parser.add_argument("--scratch-min-confidence", type=float, default=0.35,
+                         help="傷検出とみなす最小信頼度=モード投票率(0..1, 既定0.35)。"
+                              "支配的な線上に極値が乗った行/列の割合")
     parser.add_argument("--scratch-min-contrast", type=float, default=2.0,
                          help="傷とみなす最小コントラストSNR(既定2.0)。弱い勾配での誤検出防止")
+    parser.add_argument("--scratch-trace-tol", type=float, default=20.0,
+                         help="傷線追跡のモード窓半幅(px, 既定20)。波打ち量に合わせる")
     parser.add_argument("--scratch-polarity", type=str, default="auto",
                          choices=["auto", "bright", "dark"],
                          help="傷の極性: bright=明るい線(暗視野散乱像) / dark=暗い線(明視野) / "
