@@ -25,10 +25,11 @@
 - **傷(デザインナイフ)は暗視野で「明るい線」**として写る。位置は視野ごとに違う(位置合わせテストのため)。
 
 ## ファイル
-- `batch_register_images.py` — 本体。pre/postグルーピング→傷ランドマーク検出→ECC位置合わせ→共通領域クロップ→
-  傷付近&ピラー領域(自動マルチパッチ)のNCC/一致率→CSV。CLI。
+- `batch_register_images.py` — 本体。pre/postグルーピング→傷ランドマーク検出→位置合わせ(ECC or 傷十字ベース)→
+  共通領域クロップ→傷残差/細帯NCC&ピラー領域(自動マルチパッチ)の指標→CSV。CLI。
 - `utils/diagnose_pillar_periodicity.py` — FFT周期/ボケσ/間隔/nm-px/指標適性の診断。
-- `utils/diagnose_scratch.py` — 傷検出の可視化診断(帯域・追跡軌跡・inlier率・波打ち)。
+- `utils/diagnose_scratch.py` — 傷検出の可視化診断。**本体 detect_scratch_landmark を直接呼ぶ**ので
+  本体と定義上ズレない。`--image2` で pre/post を比較し傷位置差(=dxy_coarse)を出力。
 - `utils/validate_ncc_blur_sensitivity.py` — ボケ×ズレ に対するNCC/一致率感度の合成検証。
 
 ## 傷検出の設計(実データで判明した4つの事実に対応)
@@ -37,7 +38,26 @@
 3. 傷十字が視野ごとに別位置 → **全フレーム探索**(既定で範囲=画像全体)+**1次元モード投票**で支配線を同定。
    信頼度=モード投票率(0..1)。ノイズ床≈2*tol/幅≈0.03。`--scratch-trace-tol`(既定20, 波打ち量に合わせる)。
 4. pre/postの傷が大きくずれる視野がある → **pre/post各々の傷位置を中心に切り出して**ECC。
-   ECC結果が傷位置ベース並進と大きく乖離したら**並進フォールバック**(`registration_mode=translation_fallback`)。
+
+## 位置合わせと品質指標の設計(2つの弱点を修正済み)
+実データ64ペアで判明した弱点と対策:
+- **弱点A: 位置合わせの暴走** — ECCが周期ピラー(≈6.3px正弦波)の別解に収束し dx/dy が飛ぶ
+  (旧: 4-4 dy=-215px 等)。旧フォールバックのガード閾値が250pxと緩すぎて捕まらなかった。
+- **弱点B: 指標の交絡** — 旧 `scratch_ncc` は傷±250pxの500px箱NCC。中身の大半が周期ピラーで、
+  数pxの残差で位相反転し負にすらなる。**合っていても低スコア**になり判定に使えなかった。
+
+### 対策(マジックナンバー撤廃・自己検証式)
+- **傷残差ベースの自己検証**: 傷十字ベース並進(post傷−pre傷)候補と ECC 候補の**両方を実際に適用**し、
+  位置合わせ後に傷を再検出して pre傷との距離 `scratch_residual_px` を実測。ECCが残差許容
+  (`--scratch-residual-tol` 既定2px)内なら回転精密化の効くECCを採用、超えたら傷十字ベース並進へ
+  **自動フォールバック**(`registration_mode` = `ecc` / `scratch_translation`)。250px閾値は撤廃。
+  ※残差再検出は pre傷±window で極性をpre固定(warpの0埋め縁を誤検出しないため)。
+- **主品質指標 = `scratch_residual_px`(≤1〜2pxで合格)** と **`scratch_line_ncc`(傷線±8pxの細帯NCC、
+  周期ピラーを含めない)**。旧 `scratch_ncc`(500px箱)は参考値として残すが交絡のため主判定から外す。
+- **傷線の傾き角**を各行/列のインライアから推定(`angle_v_rad`/`angle_h_rad`)。pre/postの角度差から
+  回転を推定し、ECC非収束時の傷十字ベース並進にも回転を付与(縦横の角度が一致し小さい時のみ採用)。
+- **診断列**: `dxy_coarse_x/y`, `scratch_residual_px`, `residual_ecc_px`, `residual_scratch_px` を出力。
+  ECCがどれだけ飛んだか(residual_ecc)を視野ごとに確認できる。
 
 ## 実行方法(ユーザーPC)
 ```
@@ -46,28 +66,36 @@ git pull
 python batch_register_images.py --input-dir "F:\GoogleDrive_local\1.実験データ_gdrive\5.生データ D\260704 sam 位置合わせ test\df" --output-dir analysis_batch --save-patch-overlay
 ```
 主な調整オプション: `--scratch-min-confidence`(既定0.35)、`--scratch-trace-tol`(既定20)、
-`--scratch-min-contrast`(既定2.0)、`--scratch-crop-margin`(既定250)、`--patch-grid`/`--patch-size`。
+`--scratch-min-contrast`(既定2.0)、`--scratch-crop-margin`(既定250)、
+`--scratch-residual-tol`(既定2.0, ECC採否の残差許容px)、`--patch-grid`/`--patch-size`。
 
 出力(`analysis_batch/`): 位置合わせ済みpre/post(bit深度保持)、`registration_summary.csv`、
 `pillar_patch_metrics.csv`、パッチ重畳PNG、`batch_register.log`。
 
-### 品質チェック(必ず scratch_ncc で見る)
+### 品質チェック(scratch_residual_px で見る ← scratch_ncc ではない)
 ```
-python -c "import pandas as pd; d=pd.read_csv('analysis_batch/registration_summary.csv'); ok=d[d.status=='ok']; print('ok',len(ok),'/',len(d)); print('scratch_ncc median',round(ok.scratch_ncc.median(),3),'min',round(ok.scratch_ncc.min(),3)); print(ok[ok.scratch_ncc<0.85][['condition','set','scratch_confidence_pre','scratch_ncc','registration_mode','dx_px','dy_px']].to_string())"
+python -c "import pandas as pd; d=pd.read_csv('analysis_batch/registration_summary.csv'); ok=d[d.status=='ok']; print('ok',len(ok),'/',len(d)); print('scratch_residual_px  median',round(ok.scratch_residual_px.median(),2),'max',round(ok.scratch_residual_px.max(),2)); print('mode:',ok.registration_mode.value_counts().to_dict()); bad=ok[ok.scratch_residual_px>2]; print('残差>2pxの視野:',len(bad)); print(bad[['condition','set','registration_mode','scratch_residual_px','residual_ecc_px','dx_px','dy_px','dxy_coarse_x','dxy_coarse_y','scratch_confidence_pre']].to_string())"
 ```
-**成功=statusがokだけでは不十分。scratch_ncc≥0.9 で本当に合っている**と判断する。
+**成功=statusがok『かつ scratch_residual_px ≤ 1〜2px』で本当に合っている**と判断する。
+`scratch_ncc`(500px箱)は周期ピラーで交絡するので主指標にしない(参考値)。
 
 ## 進捗と経緯(検出成功率の推移)
 0/62 →(極性オート)→ 1/64 →(線追跡+並進フォールバック)→ 9/64 →(全フレーム探索)→ 47/64
 →(閾値緩め tol35/min-conf0.2)→ 64/64検出だが一部 scratch_ncc 低(~14視野)
-→(**pre/post各自の傷中心で切り出す修正: commit 098de57**)← 最新。大オフセット視野の誤位置合わせを解消するはず。
+→(pre/post各自の傷中心で切り出す修正: commit 098de57)→ **実データ再実行で判明**: scratch_ncc median 0.649,
+  min -0.29。位置合わせ暴走(4-4 dy=-215等)とscratch_ncc指標の交絡が原因と判明。
+→(**残差ベース自己検証+信頼できる指標に置換: 本コミット**)← 最新。合成データで
+  既知変換の復元・暴走ECCの自動棄却・残差が真ズレを反映することを検証済み(全PASS)。
 
 ## 次アクション(NEXT)
-1. **[ユーザー] 最新版で再実行し scratch_ncc を確認**(上の品質チェックコマンド)。
-   commit 098de57(各自の傷中心クロップ)で、前回 scratch_ncc が低かった視野(例 2-1=-0.37, 3-1=0.45,
-   7-6=0.31 など)が改善しているはず。改善を確認したら:
-   - まだ低品質な視野が残る → その視野を `diagnose_scratch.py` で可視化し原因特定(傷が視野外/極端に短い等)。
-   - 低品質が消えた → 既定パラメータ(min-confidence等)を確定し、運用値としてこのファイルに記録。
+1. **[ユーザー] 最新版で再実行し scratch_residual_px を確認**(上の新・品質チェックコマンド)。
+   狙い: 旧 scratch_ncc が低かった視野(4-4, 3-6, 7-6, 2-1 等)で暴走ECCが `scratch_translation` に
+   フォールバックし `scratch_residual_px` が小さくなっているはず。判定は残差で行う。
+   - **残差>2pxが残る視野** → `diagnose_scratch.py --image 条件-セット-0.tif --image2 条件-セット-1.tif`
+     で pre/post の傷位置差(dxy_coarse)を可視化。傷がpre/postで別位置に取れている/視野外/
+     極端に短い、のどれかを特定。CSVの `dxy_coarse` `residual_ecc_px` `scratch_confidence_pre` も併読。
+   - **残差が全視野で小さい** → 既定パラメータを運用値として確定しこのファイルに記録。
+   結果CSV(または上コマンド出力)を貼ってもらえれば私が解釈して次を詰める。
 2. **[ユーザー] pixel pitch ≈ 32 nm/px を顕微鏡キャリブレーションで確認。**
 3. **[ユーザー] -anti の残ブランチ `claude/batch-image-registration-qe4cp7` を削除**
    (私はegressポリシー403で削除不可。GitHub UIのBranchesから)。

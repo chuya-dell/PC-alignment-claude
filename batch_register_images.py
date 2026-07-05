@@ -144,7 +144,8 @@ def _trace_line(band: np.ndarray, line_axis: int, polarity: str,
 
     noise = np.median(np.abs(sub - row_med[:, None])) * 1.4826 + 1e-6
     result = {"position": float(np.median(pos)), "confidence": 0.0,
-              "contrast_snr": 0.0, "waviness": float(np.std(pos)), "polarity": polarity}
+              "contrast_snr": 0.0, "waviness": float(np.std(pos)), "polarity": polarity,
+              "angle_rad": 0.0}
     if N < 10:
         return result
 
@@ -163,6 +164,15 @@ def _trace_line(band: np.ndarray, line_axis: int, polarity: str,
     result["waviness"] = float(np.std(pos[inlier])) if inlier.sum() > 1 else 0.0
     med_contrast = np.median(contrast[inlier]) if inlier.any() else 0.0
     result["contrast_snr"] = float(med_contrast / noise)
+
+    # インライア行に対する position の1次傾き(=線の傾き, m座標系: d(position)/d(row))。
+    # 回転推定に使う。インライアが少ない/短い場合は 0(傾き無し)とする。
+    rows = np.nonzero(inlier)[0].astype(np.float64)
+    if rows.size >= 10 and (rows.max() - rows.min()) >= 0.25 * N:
+        slope = float(np.polyfit(rows, pos[inlier], 1)[0])
+    else:
+        slope = 0.0
+    result["angle_rad"] = float(np.arctan(slope))
     return result
 
 
@@ -219,7 +229,9 @@ def detect_scratch_landmark(
             "confidence_x": v["confidence"], "confidence_y": hln["confidence"],
             "contrast_x": v["contrast_snr"], "contrast_y": hln["contrast_snr"],
             "polarity_x": v["polarity"], "polarity_y": hln["polarity"],
-            "waviness_x": v["waviness"], "waviness_y": hln["waviness"]}
+            "waviness_x": v["waviness"], "waviness_y": hln["waviness"],
+            # 縦傷: d(col)/d(row) の傾き角、横傷: d(row)/d(col) の傾き角(いずれも rad)
+            "angle_v_rad": v["angle_rad"], "angle_h_rad": hln["angle_rad"]}
 
 
 # ===================== 位置合わせ (phaseCorrelate -> ECC) =====================
@@ -238,7 +250,66 @@ class RegistrationResult:
     confidence_pre: float = float("nan")   # min(confidence_x, confidence_y) of pre
     confidence_post: float = float("nan")
     polarity: str = ""
-    mode: str = ""  # "ecc" / "translation_fallback"
+    mode: str = ""  # "ecc" / "scratch_translation"
+    # 傷位置ベースの粗い並進(post傷 - pre傷)。診断用。
+    dxy_coarse: Optional[tuple] = None
+    # 位置合わせ後に傷を再検出して測った残差(px)。採用warpのもの=主品質指標。
+    scratch_residual_px: float = float("nan")
+    # ECC候補単体の傷残差(px)。診断用: 大きいほどECCが別解へ飛んでいる。
+    residual_ecc_px: float = float("nan")
+    # 傷十字ベース並進候補の傷残差(px)。診断用(構造上ほぼ0のはず)。
+    residual_scratch_px: float = float("nan")
+
+
+def _euclidean_matrix(R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    M = np.zeros((2, 3), dtype=np.float64)
+    M[:, :2] = R
+    M[:, 2] = t
+    return M
+
+
+def _scratch_rotation_deg(pre_lm: dict, post_lm: dict,
+                          max_deg: float = 5.0, agree_tol_deg: float = 1.0) -> float:
+    """pre→post の回転角(度)を傷十字の線傾きから推定する。
+    縦傷と横傷から独立に推定し、両者が近い(agree_tol_deg以内)かつ小さい(max_deg以内)場合のみ
+    採用する。そうでなければ 0(=並進のみ)を返す(不確かな回転で悪化させない)。"""
+    tv = np.degrees(pre_lm["angle_v_rad"] - post_lm["angle_v_rad"])
+    th = np.degrees(post_lm["angle_h_rad"] - pre_lm["angle_h_rad"])
+    if abs(tv - th) > agree_tol_deg:
+        return 0.0
+    theta = 0.5 * (tv + th)
+    if abs(theta) > max_deg:
+        return 0.0
+    return float(theta)
+
+
+def _euclidean_from_scratch(pre_lm: dict, post_lm: dict, rot_deg: float) -> np.ndarray:
+    """傷十字の交点(pre)→(post)を一致させる pre→post Euclidean 変換 M。
+    p_post = R p_pre + (c_post - R c_pre)。rot_deg=0 なら純並進(t=post傷-pre傷)。"""
+    th = np.radians(rot_deg)
+    R = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]], dtype=np.float64)
+    c_pre = np.array([pre_lm["x"], pre_lm["y"]], dtype=np.float64)
+    c_post = np.array([post_lm["x"], post_lm["y"]], dtype=np.float64)
+    return _euclidean_matrix(R, c_post - R @ c_pre)
+
+
+def _scratch_residual(pre_lm: dict, post_img: np.ndarray,
+                      M_global: np.ndarray, scratch_kwargs: dict, window: int) -> float:
+    """候補 warp を post に適用して pre 座標系へ戻し、傷を再検出して pre 傷位置との距離(px)。
+    位置合わせが正しければ ≈0。ECCが別解へ飛べば大きくなる。周期ピラーに交絡されない。
+
+    ロバスト化のポイント:
+      - 探索を pre 傷位置±window に限定(warp後の黒縁を掴まないため。ECC暴走はwindow内で検出)。
+      - 極性を pre で採用したものに固定(auto だと warp の 0 埋め縁を『暗線』として拾う)。"""
+    h, w = post_img.shape[:2]
+    aligned, _ = apply_warp(post_img, M_global)
+    px, py = pre_lm["x"], pre_lm["y"]
+    kw = dict(scratch_kwargs)
+    kw["polarity"] = pre_lm["polarity_x"]
+    kw["v_col_range"] = (int(px - window), int(px + window))
+    kw["h_row_range"] = (int(py - window), int(py + window))
+    lm = detect_scratch_landmark(aligned, **kw)
+    return float(np.hypot(lm["x"] - px, lm["y"] - py))
 
 
 def register_pair(
@@ -250,6 +321,7 @@ def register_pair(
     ecc_eps: float,
     ecc_iterations: int,
     min_contrast: float = 2.0,
+    residual_tol: float = 2.0,
 ) -> RegistrationResult:
     h, w = pre_img.shape[:2]
 
@@ -277,11 +349,15 @@ def register_pair(
         result.status = "scratch_not_detected"
         return result
 
-    # 傷位置から直接得られる粗い並進(ECC失敗/低品質時のフォールバックにも使う)。
-    # M(pre->post)の並進成分 = post傷位置 - pre傷位置。
+    # 傷位置から直接得られる粗い並進(post傷 - pre傷)。診断・フォールバック用。
     dxy_coarse = np.array([post_lm["x"] - pre_lm["x"], post_lm["y"] - pre_lm["y"]], dtype=np.float64)
+    result.dxy_coarse = (float(dxy_coarse[0]), float(dxy_coarse[1]))
 
-    # pre/post それぞれ「自分の傷位置」を中心に同サイズで切り出す。
+    # --- 候補A: 傷十字ベースの Euclidean(並進 + 傷角度から推定した回転)---
+    rot_scratch = _scratch_rotation_deg(pre_lm, post_lm)
+    M_scratch = _euclidean_from_scratch(pre_lm, post_lm, rot_scratch)
+
+    # pre/post それぞれ「自分の傷位置」を中心に同サイズで切り出す(ECC入力)。
     # 位置合わせテストでは pre/post の傷が大きくずれる視野があり、pre基準の同一座標で
     # post を切ると post 側の窓に傷が入らず ECC が別解(ピラー模様)に収束してしまう。
     size = int(min(2 * crop_margin, h, w))
@@ -297,56 +373,55 @@ def register_pair(
     pre_crop, x0p, y0p = _crop_around(pre_img, pre_lm["x"], pre_lm["y"])
     post_crop, x0q, y0q = _crop_around(post_img, post_lm["x"], post_lm["y"])
 
-    def _finalize(R, t_global, mode):
-        M_global = np.zeros((2, 3), dtype=np.float64)
-        M_global[:, :2] = R
-        M_global[:, 2] = t_global
-        result.warp_matrix = M_global
-        result.dx = float(t_global[0])
-        result.dy = float(t_global[1])
-        result.rotation_deg = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
-        result.mode = mode
-        return result
-
-    def _translation_fallback():
-        # 傷位置から得た並進のみで位置合わせ(回転なし)。ECCが使えない場合の保険。
-        return _finalize(np.eye(2), dxy_coarse, "translation_fallback")
-
-    # 1. phaseCorrelate で残差並進の初期値(両クロップは各々の傷中心なので初期ズレは小さい)
+    # --- 候補B: phaseCorrelate 初期化 -> findTransformECC(回転+残差並進を精密化)---
+    M_ecc = None
     hann = cv2.createHanningWindow((size, size), cv2.CV_32F)
     try:
         (shift_x, shift_y), _response = cv2.phaseCorrelate(pre_crop, post_crop, hann)
-    except cv2.error as exc:
-        logger.warning("phaseCorrelate 失敗(傷位置ベースの並進にフォールバック): %s", exc)
-        return _translation_fallback()
-
-    warp_matrix = np.array([[1, 0, shift_x], [0, 1, shift_y]], dtype=np.float32)
-
-    # 2. findTransformECC (MOTION_EUCLIDEAN) で回転+残差並進を精密化
-    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, ecc_iterations, ecc_eps)
-    try:
+        warp_matrix = np.array([[1, 0, shift_x], [0, 1, shift_y]], dtype=np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, ecc_iterations, ecc_eps)
         _cc, warp_matrix = cv2.findTransformECC(
             pre_crop, post_crop, warp_matrix, cv2.MOTION_EUCLIDEAN, criteria
         )
+        # クロップ原点が pre/post で異なるため一般式で全体座標系へ合成する:
+        #   p_post = R p_pre + [ (x0q,y0q) - R (x0p,y0p) + t_local ]
+        R = warp_matrix[:, :2].astype(np.float64)
+        t_local = warp_matrix[:, 2].astype(np.float64)
+        op = np.array([x0p, y0p], dtype=np.float64)
+        oq = np.array([x0q, y0q], dtype=np.float64)
+        M_ecc = _euclidean_matrix(R, oq - R @ op + t_local)
     except cv2.error:
-        logger.info("findTransformECC 非収束のため傷位置ベースの並進で位置合わせします。")
-        return _translation_fallback()
+        logger.info("phaseCorrelate/findTransformECC 非収束。傷十字ベース並進を採用します。")
 
-    # クロップ原点が pre/post で異なるため一般式で全体座標系へ合成する:
-    #   p_post = R p_pre + [ (x0q,y0q) - R (x0p,y0p) + t_local ]
-    R = warp_matrix[:, :2].astype(np.float64)
-    t_local = warp_matrix[:, 2].astype(np.float64)
-    op = np.array([x0p, y0p], dtype=np.float64)
-    oq = np.array([x0q, y0q], dtype=np.float64)
-    t_global = oq - R @ op + t_local
+    # --- 自己検証: 各候補を実際に適用して傷を再検出し残差(px)を実測 ---
+    # 傷十字ベースは構造上 pre 傷へ戻るので残差≈0。ECCは別解へ飛ぶと残差が大きくなる。
+    # よって 250px 等のマジックナンバーではなく「位置合わせ後に傷がどれだけ合ったか」で選ぶ。
+    res_window = max(int(crop_margin), 96)
+    res_scratch = _scratch_residual(pre_lm, post_img, M_scratch, scratch_kwargs, res_window)
+    result.residual_scratch_px = res_scratch
+    if M_ecc is not None:
+        res_ecc = _scratch_residual(pre_lm, post_img, M_ecc, scratch_kwargs, res_window)
+    else:
+        res_ecc = float("inf")
+    result.residual_ecc_px = res_ecc
 
-    # 品質チェック: ECC結果と傷位置ベース並進が大きく食い違う(=別解に収束)場合は
-    # 信頼できる傷位置ベースの並進にフォールバックする。
-    if np.hypot(*(t_global - dxy_coarse)) > max(crop_margin, 50):
-        logger.info("ECC結果が傷位置と乖離のため並進フォールバックに切替。")
-        return _translation_fallback()
+    def _finalize(M_global, residual, mode):
+        R = M_global[:, :2]
+        result.warp_matrix = M_global
+        result.dx = float(M_global[0, 2])
+        result.dy = float(M_global[1, 2])
+        result.rotation_deg = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
+        result.scratch_residual_px = float(residual)
+        result.mode = mode
+        return result
 
-    return _finalize(R, t_global, "ecc")
+    # ECC が傷を残差許容内(residual_tol)に保っていれば、回転を精密化できる ECC を優先。
+    # そうでなければ傷十字ベース並進(=暴走ECCの自動棄却)。
+    if M_ecc is not None and res_ecc <= max(residual_tol, res_scratch):
+        return _finalize(M_ecc, res_ecc, "ecc")
+    if res_scratch <= res_ecc:
+        return _finalize(M_scratch, res_scratch, "scratch_translation")
+    return _finalize(M_ecc, res_ecc, "ecc")
 
 
 def apply_warp(post_img: np.ndarray, warp_matrix: np.ndarray) -> tuple:
@@ -425,6 +500,22 @@ def region_metrics(pre_img, aligned_post, box, match_threshold) -> dict:
     a = pre_img[y0:y1, x0:x1]
     b = aligned_post[y0:y1, x0:x1]
     return {"ncc": compute_ncc(a, b), "match_rate": compute_match_rate(a, b, match_threshold)}
+
+
+def compute_scratch_line_ncc(pre_crop, post_crop, sxl, syl, half=8) -> float:
+    """傷線に沿った細帯(縦傷=幅2*half列の全高帯 / 横傷=高さ2*half行の全幅帯)だけで NCC を取る。
+    500px箱と違い周期ピラーをほとんど含まないため、非周期の傷そのものが合っているかを測れる。
+    縦横の有効な帯の平均を返す。"""
+    h, w = pre_crop.shape[:2]
+    vals = []
+    x0, x1 = int(round(sxl - half)), int(round(sxl + half + 1))
+    if x0 >= 0 and x1 <= w and x1 - x0 >= 2:
+        vals.append(compute_ncc(pre_crop[:, x0:x1], post_crop[:, x0:x1]))
+    y0, y1 = int(round(syl - half)), int(round(syl + half + 1))
+    if y0 >= 0 and y1 <= h and y1 - y0 >= 2:
+        vals.append(compute_ncc(pre_crop[y0:y1, :], post_crop[y0:y1, :]))
+    vals = [v for v in vals if not np.isnan(v)]
+    return float(np.mean(vals)) if vals else float("nan")
 
 
 def _intervals_overlap(a0, a1, b0, b1) -> bool:
@@ -615,9 +706,15 @@ def process_group(label, key: GroupKey, files: dict, args, output_dir: Path):
             "dy_px": float("nan"),
             "rotation_deg": float("nan"),
             "registration_mode": "",
+            "dxy_coarse_x": float("nan"),
+            "dxy_coarse_y": float("nan"),
+            "scratch_residual_px": float("nan"),
+            "residual_ecc_px": float("nan"),
+            "residual_scratch_px": float("nan"),
             "scratch_confidence_pre": float("nan"),
             "scratch_confidence_post": float("nan"),
             "scratch_polarity": "",
+            "scratch_line_ncc": float("nan"),
             "scratch_ncc": float("nan"),
             "scratch_match_rate_pct": float("nan"),
             "n_pillar_patches": 0,
@@ -647,6 +744,7 @@ def process_group(label, key: GroupKey, files: dict, args, output_dir: Path):
             ecc_eps=args.ecc_eps,
             ecc_iterations=args.ecc_iterations,
             min_contrast=args.scratch_min_contrast,
+            residual_tol=args.scratch_residual_tol,
         )
 
         row["scratch_detected_pre"] = reg.scratch_detected_pre
@@ -655,6 +753,12 @@ def process_group(label, key: GroupKey, files: dict, args, output_dir: Path):
         row["scratch_confidence_post"] = reg.confidence_post
         row["scratch_polarity"] = reg.polarity
         row["registration_mode"] = reg.mode
+        row["scratch_residual_px"] = reg.scratch_residual_px
+        row["residual_ecc_px"] = reg.residual_ecc_px
+        row["residual_scratch_px"] = reg.residual_scratch_px
+        if reg.dxy_coarse is not None:
+            row["dxy_coarse_x"] = reg.dxy_coarse[0]
+            row["dxy_coarse_y"] = reg.dxy_coarse[1]
 
         if reg.status != "ok":
             logger.warning(
@@ -667,8 +771,11 @@ def process_group(label, key: GroupKey, files: dict, args, output_dir: Path):
             rows.append(row)
             continue
 
-        if reg.mode == "translation_fallback":
-            logger.info("[%s] %s は傷位置ベースの並進のみで位置合わせ(ECC非収束)。", label, post_path.name)
+        if reg.mode == "scratch_translation":
+            logger.info(
+                "[%s] %s は傷十字ベースの並進で位置合わせ(ECC残差 %.1fpx > 許容 %.1fpx のため棄却)。",
+                label, post_path.name, reg.residual_ecc_px, args.scratch_residual_tol,
+            )
 
         row["dx_px"] = reg.dx
         row["dy_px"] = reg.dy
@@ -702,6 +809,10 @@ def process_group(label, key: GroupKey, files: dict, args, output_dir: Path):
         scratch_metrics = region_metrics(pre_cropped_f, post_cropped_f, scratch_box_local, args.match_threshold)
         row["scratch_ncc"] = scratch_metrics["ncc"]
         row["scratch_match_rate_pct"] = scratch_metrics["match_rate"]
+        # 傷線に沿った細帯NCC(周期ピラーを含めない、非周期の傷そのものの一致度)
+        row["scratch_line_ncc"] = compute_scratch_line_ncc(
+            pre_cropped_f, post_cropped_f, sx - left, sy - top
+        )
 
         # ピラー領域評価: 傷帯を除いた画像全体からグリッド状に自動サンプリングした
         # 複数パッチで NCC・一致率を個別に算出し、集計値(平均・最小・標準偏差)を記録する。
@@ -800,6 +911,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          help="傷とみなす最小コントラストSNR(既定2.0)。弱い勾配での誤検出防止")
     parser.add_argument("--scratch-trace-tol", type=float, default=20.0,
                          help="傷線追跡のモード窓半幅(px, 既定20)。波打ち量に合わせる")
+    parser.add_argument("--scratch-residual-tol", type=float, default=2.0,
+                         help="位置合わせ後の傷残差の許容(px, 既定2)。ECC結果をこの残差内に"
+                              "保てればECCを採用、超えたら傷十字ベース並進に自動フォールバック")
     parser.add_argument("--scratch-polarity", type=str, default="auto",
                          choices=["auto", "bright", "dark"],
                          help="傷の極性: bright=明るい線(暗視野散乱像) / dark=暗い線(明視野) / "
