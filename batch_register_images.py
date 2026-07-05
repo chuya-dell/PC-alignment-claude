@@ -277,23 +277,25 @@ def register_pair(
         result.status = "scratch_not_detected"
         return result
 
-    # 傷位置から直接得られる粗い並進(ECC失敗時のフォールバックにも使う)。
+    # 傷位置から直接得られる粗い並進(ECC失敗/低品質時のフォールバックにも使う)。
     # M(pre->post)の並進成分 = post傷位置 - pre傷位置。
     dxy_coarse = np.array([post_lm["x"] - pre_lm["x"], post_lm["y"] - pre_lm["y"]], dtype=np.float64)
 
-    # 傷ランドマーク周辺の同一座標範囲(pre基準)を pre/post 双方から切り出す。
-    px, py = pre_lm["x"], pre_lm["y"]
-    x0 = int(max(0, px - crop_margin))
-    x1 = int(min(w, px + crop_margin))
-    y0 = int(max(0, py - crop_margin))
-    y1 = int(min(h, py + crop_margin))
-
-    if (x1 - x0) < 50 or (y1 - y0) < 50:
+    # pre/post それぞれ「自分の傷位置」を中心に同サイズで切り出す。
+    # 位置合わせテストでは pre/post の傷が大きくずれる視野があり、pre基準の同一座標で
+    # post を切ると post 側の窓に傷が入らず ECC が別解(ピラー模様)に収束してしまう。
+    size = int(min(2 * crop_margin, h, w))
+    if size < 50:
         result.status = "scratch_crop_too_small"
         return result
 
-    pre_crop = pre_img[y0:y1, x0:x1].astype(np.float32)
-    post_crop = post_img[y0:y1, x0:x1].astype(np.float32)
+    def _crop_around(img, cx, cy):
+        x0 = int(round(cx - size / 2)); y0 = int(round(cy - size / 2))
+        x0 = min(max(0, x0), w - size); y0 = min(max(0, y0), h - size)
+        return img[y0:y0 + size, x0:x0 + size].astype(np.float32), x0, y0
+
+    pre_crop, x0p, y0p = _crop_around(pre_img, pre_lm["x"], pre_lm["y"])
+    post_crop, x0q, y0q = _crop_around(post_img, post_lm["x"], post_lm["y"])
 
     def _finalize(R, t_global, mode):
         M_global = np.zeros((2, 3), dtype=np.float64)
@@ -310,8 +312,8 @@ def register_pair(
         # 傷位置から得た並進のみで位置合わせ(回転なし)。ECCが使えない場合の保険。
         return _finalize(np.eye(2), dxy_coarse, "translation_fallback")
 
-    # 1. phaseCorrelate で並進初期値(傷位置ベースの粗並進を初期値に足す)
-    hann = cv2.createHanningWindow((pre_crop.shape[1], pre_crop.shape[0]), cv2.CV_32F)
+    # 1. phaseCorrelate で残差並進の初期値(両クロップは各々の傷中心なので初期ズレは小さい)
+    hann = cv2.createHanningWindow((size, size), cv2.CV_32F)
     try:
         (shift_x, shift_y), _response = cv2.phaseCorrelate(pre_crop, post_crop, hann)
     except cv2.error as exc:
@@ -320,23 +322,30 @@ def register_pair(
 
     warp_matrix = np.array([[1, 0, shift_x], [0, 1, shift_y]], dtype=np.float32)
 
-    # 2. findTransformECC (MOTION_EUCLIDEAN) で回転+並進を精密化
+    # 2. findTransformECC (MOTION_EUCLIDEAN) で回転+残差並進を精密化
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, ecc_iterations, ecc_eps)
     try:
         _cc, warp_matrix = cv2.findTransformECC(
             pre_crop, post_crop, warp_matrix, cv2.MOTION_EUCLIDEAN, criteria
         )
     except cv2.error:
-        # ECC非収束: 傷位置ベースの並進のみで確定(スキップせず処理継続)
         logger.info("findTransformECC 非収束のため傷位置ベースの並進で位置合わせします。")
         return _translation_fallback()
 
-    # pre_crop / post_crop は同一オフセット(x0, y0)で切り出しているため、
-    # クロップ座標系の変換行列をそのまま画像全体の座標系へ変換できる。
+    # クロップ原点が pre/post で異なるため一般式で全体座標系へ合成する:
+    #   p_post = R p_pre + [ (x0q,y0q) - R (x0p,y0p) + t_local ]
     R = warp_matrix[:, :2].astype(np.float64)
     t_local = warp_matrix[:, 2].astype(np.float64)
-    offset = np.array([x0, y0], dtype=np.float64)
-    t_global = t_local + offset - R @ offset
+    op = np.array([x0p, y0p], dtype=np.float64)
+    oq = np.array([x0q, y0q], dtype=np.float64)
+    t_global = oq - R @ op + t_local
+
+    # 品質チェック: ECC結果と傷位置ベース並進が大きく食い違う(=別解に収束)場合は
+    # 信頼できる傷位置ベースの並進にフォールバックする。
+    if np.hypot(*(t_global - dxy_coarse)) > max(crop_margin, 50):
+        logger.info("ECC結果が傷位置と乖離のため並進フォールバックに切替。")
+        return _translation_fallback()
+
     return _finalize(R, t_global, "ecc")
 
 
