@@ -97,10 +97,15 @@ python -c "import pandas as pd; d=pd.read_csv('analysis_batch/registration_summa
   apply_warpがBORDER_CONSTANT(0埋め)だったため、位置合わせ後の画像上端約20行が
   無効領域として真っ黒に埋まり、探索窓内でこの人工的な黒縁を傷の影より暗い候補として
   誤検出(黒縁までの距離≈140px=実測残差と一致)。
-→(**_scratch_residual内のwarpをBORDER_REPLICATEに変更して修正: 本コミット 390660e**)
-  ← 最新。実データ4-1を模した合成テスト(傷十字が画像端付近+境界方向シフト)を追加し、
-  修正前に実際に residual=140.00px(実データと同値)を再現、修正後 residual=1.00px に
-  改善することを検証。全テストPASS。**実データでの再検証がまだ済んでいない**
+→(_scratch_residual内のwarpをBORDER_REPLICATEに変更して修正: commit 390660e)
+  → **実データ再実行で判明**: scratch_residual_px median 6.4px→5.0px、max 153px→26.48px
+  に改善(4-1は解消)。最悪ケース3-8を diagnose_scratch.py --image2 で調査 → 横傷が
+  pre='dark'(conf0.45)/post='bright'(conf0.37)と、信号が弱い(コントラストmin閾値
+  ギリギリ)溝で pre/postが独立にauto極性判定した結果、溝の暗い側/明るい側という
+  別々の物理特徴を追跡してしまい系統的なズレが発生。
+→(**postの検出にpreの極性を強制して同一特徴追跡に統一: 本コミット 2cb9076**)← 最新。
+  暗側/明側の相対強度をpre/postで逆転させた合成シーンで、修正前に並進復元誤差15px、
+  修正後0.22pxに改善することを検証。全テストPASS。**実データでの再検証がまだ済んでいない**
   (要ユーザー再実行)。
 
 ## 次アクション(NEXT)
