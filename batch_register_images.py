@@ -198,6 +198,8 @@ def detect_scratch_landmark(
     edge_margin: int = 8,
     polarity: str = "auto",
     trace_tol: float = 20.0,
+    polarity_v: Optional[str] = None,
+    polarity_h: Optional[str] = None,
 ) -> dict:
     """
     デザインナイフ傷(縦線・横線)のランドマーク座標を検出する。
@@ -205,6 +207,9 @@ def detect_scratch_landmark(
     画像全体(範囲=None)から支配的な縦/横の明線(または暗線)を探す。
     各範囲を明示指定すればその中に限定して探索できる。
     polarity で暗い傷/明るい傷/自動判別を切替。信頼度はモード投票率(0..1)。
+    polarity_v/polarity_h を指定すると縦傷/横傷を個別の極性で固定できる
+    (auto では縦横で異なる極性が採用されることが実データで多く、両方に同じ
+    polarity を強制すると片方が誤検出する。残差再検出で使用)。
     """
     h, w = img.shape[:2]
     vc0, vc1 = v_col_range if v_col_range else (0, w)
@@ -212,7 +217,7 @@ def detect_scratch_landmark(
     vc0, vc1 = max(0, vc0), min(w, vc1)
     vr0, vr1 = max(0, vr0), min(h, vr1)
     v_band = img[vr0:vr1, vc0:vc1].astype(np.float64)
-    v = _detect_line(v_band, line_axis=0, polarity=polarity,
+    v = _detect_line(v_band, line_axis=0, polarity=polarity_v or polarity,
                      edge_margin=edge_margin, smooth_window=smooth_window, tol=trace_tol)
     scratch_x = vc0 + v["position"]
 
@@ -221,7 +226,7 @@ def detect_scratch_landmark(
     hr0, hr1 = max(0, hr0), min(h, hr1)
     hc0, hc1 = max(0, hc0), min(w, hc1)
     h_band = img[hr0:hr1, hc0:hc1].astype(np.float64)
-    hln = _detect_line(h_band, line_axis=1, polarity=polarity,
+    hln = _detect_line(h_band, line_axis=1, polarity=polarity_h or polarity,
                        edge_margin=edge_margin, smooth_window=smooth_window, tol=trace_tol)
     scratch_y = hr0 + hln["position"]
 
@@ -300,12 +305,15 @@ def _scratch_residual(pre_lm: dict, post_img: np.ndarray,
 
     ロバスト化のポイント:
       - 探索を pre 傷位置±window に限定(warp後の黒縁を掴まないため。ECC暴走はwindow内で検出)。
-      - 極性を pre で採用したものに固定(auto だと warp の 0 埋め縁を『暗線』として拾う)。"""
-    h, w = post_img.shape[:2]
+      - 極性を pre で採用したものに**縦横別々に**固定(auto だと warp の 0 埋め縁を誤検出する。
+        縦傷と横傷で極性が異なる視野が実データで多く、片方の極性をもう片方に流用すると
+        誤った極性で探索し無関係な特徴を掴んで見かけ上の残差が跳ね上がるバグがあったため)。"""
     aligned, _ = apply_warp(post_img, M_global)
     px, py = pre_lm["x"], pre_lm["y"]
     kw = dict(scratch_kwargs)
-    kw["polarity"] = pre_lm["polarity_x"]
+    kw.pop("polarity", None)
+    kw["polarity_v"] = pre_lm["polarity_x"]
+    kw["polarity_h"] = pre_lm["polarity_y"]
     kw["v_col_range"] = (int(px - window), int(px + window))
     kw["h_row_range"] = (int(py - window), int(py + window))
     lm = detect_scratch_landmark(aligned, **kw)
