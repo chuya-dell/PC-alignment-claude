@@ -304,11 +304,14 @@ def _scratch_residual(pre_lm: dict, post_img: np.ndarray,
     位置合わせが正しければ ≈0。ECCが別解へ飛べば大きくなる。周期ピラーに交絡されない。
 
     ロバスト化のポイント:
-      - 探索を pre 傷位置±window に限定(warp後の黒縁を掴まないため。ECC暴走はwindow内で検出)。
-      - 極性を pre で採用したものに**縦横別々に**固定(auto だと warp の 0 埋め縁を誤検出する。
-        縦傷と横傷で極性が異なる視野が実データで多く、片方の極性をもう片方に流用すると
-        誤った極性で探索し無関係な特徴を掴んで見かけ上の残差が跳ね上がるバグがあったため)。"""
-    aligned, _ = apply_warp(post_img, M_global)
+      - 探索を pre 傷位置±window に限定(ECC暴走はwindow内で検出できる)。
+      - 極性を pre で採用したものに**縦横別々に**固定(auto だと誤検出する。縦傷と横傷で極性が
+        異なる視野が実データで多く、片方の極性をもう片方に流用すると誤った極性で探索し
+        無関係な特徴を掴んで見かけ上の残差が跳ね上がるバグがあったため)。
+      - warp は BORDER_REPLICATE で行う(BORDER_CONSTANT=0埋めだと、傷が画像端に近く並進が
+        その方向を向く視野で、無効領域の人工的な黒縁が背景よりずっと暗いため『暗い傷』の
+        探索窓内でこの黒縁を誤って掴んでしまい、見かけ上の残差が跳ね上がるバグがあったため)。"""
+    aligned, _ = apply_warp(post_img, M_global, border_mode=cv2.BORDER_REPLICATE)
     px, py = pre_lm["x"], pre_lm["y"]
     kw = dict(scratch_kwargs)
     kw.pop("polarity", None)
@@ -432,16 +435,21 @@ def register_pair(
     return _finalize(M_ecc, res_ecc, "ecc")
 
 
-def apply_warp(post_img: np.ndarray, warp_matrix: np.ndarray) -> tuple:
+def apply_warp(post_img: np.ndarray, warp_matrix: np.ndarray,
+               border_mode: int = cv2.BORDER_CONSTANT) -> tuple:
     """M_global (dst->src, WARP_INVERSE_MAP) を用いて post 画像を pre 座標系へ変換する。
-    戻り値: (aligned_post_float, valid_mask)"""
+    戻り値: (aligned_post_float, valid_mask)
+
+    border_mode: 既定の BORDER_CONSTANT(0埋め) は最終出力用(mask で無効域を除いてクロップする
+    前提)。傷の再検出目的では 0埋めが人工的な極端に暗い縁を作り誤検出の原因になるため、
+    BORDER_REPLICATE(端の画素を引き伸ばす)を指定して回避する(_scratch_residual で使用)。"""
     h, w = post_img.shape[:2]
     M = warp_matrix.astype(np.float32)
 
     aligned = cv2.warpAffine(
         post_img.astype(np.float32), M, (w, h),
         flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=0.0,
+        borderMode=border_mode, borderValue=0.0,
     )
     mask = cv2.warpAffine(
         np.ones((h, w), dtype=np.uint8), M, (w, h),
