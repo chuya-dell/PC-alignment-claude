@@ -84,8 +84,14 @@ python -c "import pandas as pd; d=pd.read_csv('analysis_batch/registration_summa
 →(閾値緩め tol35/min-conf0.2)→ 64/64検出だが一部 scratch_ncc 低(~14視野)
 →(pre/post各自の傷中心で切り出す修正: commit 098de57)→ **実データ再実行で判明**: scratch_ncc median 0.649,
   min -0.29。位置合わせ暴走(4-4 dy=-215等)とscratch_ncc指標の交絡が原因と判明。
-→(**残差ベース自己検証+信頼できる指標に置換: 本コミット**)← 最新。合成データで
-  既知変換の復元・暴走ECCの自動棄却・残差が真ズレを反映することを検証済み(全PASS)。
+→(残差ベース自己検証+信頼できる指標に置換: commit dc7aa64)→ **実データ再実行で判明**:
+  scratch_residual_px median 21px, max 277px。高信頼度視野でも残差100px超が多発、
+  dxy_coarseがほぼ0の視野ですら残差244px等、物理的ズレでは説明不能な挙動。
+  原因は _scratch_residual が縦傷の極性を横傷検出にも流用するバグ(実データは縦横で
+  極性が異なる視野が多い)→ 誤極性で無関係な特徴を掴み見かけ上の残差が跳ね上がっていた。
+→(**polarity_v/polarity_h 分離で修正: 本コミット 2a1f2c4**)← 最新。合成データに
+  縦横極性不一致シーンの回帰テストを追加(修正前に実際に失敗することを確認済み)、
+  全テストPASS。**実データでの再検証がまだ済んでいない**(要ユーザー再実行)。
 
 ## 次アクション(NEXT)
 1. **[ユーザー] 最新版で再実行し scratch_residual_px を確認**(上の新・品質チェックコマンド)。
