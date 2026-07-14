@@ -337,7 +337,14 @@ def register_pair(
     h, w = pre_img.shape[:2]
 
     pre_lm = detect_scratch_landmark(pre_img, **scratch_kwargs)
-    post_lm = detect_scratch_landmark(post_img, **scratch_kwargs)
+    # post は pre で採用された極性を縦横それぞれ強制する(polarity="auto" のまま独立に
+    # 選ばせると、信号が弱い視野で pre/post が溝の暗い側/明るい側を別々に掴んでしまい、
+    # 見かけ上のズレが生じるため。同じ物理特徴を追跡させて dxy_coarse を意味のあるものにする)。
+    post_kwargs = dict(scratch_kwargs)
+    post_kwargs.pop("polarity", None)
+    post_kwargs["polarity_v"] = pre_lm["polarity_x"]
+    post_kwargs["polarity_h"] = pre_lm["polarity_y"]
+    post_lm = detect_scratch_landmark(post_img, **post_kwargs)
 
     def _ok(lm):
         return (lm["confidence_x"] >= min_confidence and lm["confidence_y"] >= min_confidence
