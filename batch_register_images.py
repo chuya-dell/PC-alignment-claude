@@ -102,6 +102,28 @@ def _subpixel_min(profile: np.ndarray, idx: int) -> float:
     return float(idx)
 
 
+def _subpixel_offset(sub: np.ndarray, idx: np.ndarray) -> np.ndarray:
+    """_subpixel_min のベクトル化版。各行 sub[i,:] の整数極値位置 idx[i] を、隣接3点
+    (idx-1,idx,idx+1) の放物線頂点でサブピクセル補正するオフセットを返す(行数と同じ長さ)。
+    端(idx=0 or idx=w-1)や放物線が定義できない(分母0)行は補正なし(0)。"""
+    n, w = sub.shape
+    offset = np.zeros(n, dtype=np.float64)
+    valid = (idx > 0) & (idx < w - 1)
+    if not np.any(valid):
+        return offset
+    rows = np.nonzero(valid)[0]
+    ic = idx[valid]
+    y0 = sub[rows, ic - 1]
+    y1 = sub[rows, ic]
+    y2 = sub[rows, ic + 1]
+    denom = y0 - 2 * y1 + y2
+    nz = denom != 0
+    off = np.zeros(len(rows), dtype=np.float64)
+    off[nz] = 0.5 * (y0[nz] - y2[nz]) / denom[nz]
+    offset[rows] = np.clip(off, -1.0, 1.0)
+    return offset
+
+
 def _smooth_rows(m: np.ndarray, k: int) -> np.ndarray:
     kern = np.ones(k) / k
     return np.apply_along_axis(lambda v: np.convolve(v, kern, mode="same"), 1, m)
@@ -136,10 +158,12 @@ def _trace_line(band: np.ndarray, line_axis: int, polarity: str,
     row_med = np.median(sub, axis=1)
 
     if polarity == "bright":
-        pos = (lo + np.argmax(sub, axis=1)).astype(np.float64)
+        idx = np.argmax(sub, axis=1)
+        pos = (lo + idx).astype(np.float64) + _subpixel_offset(sub, idx)
         contrast = np.max(sub, axis=1) - row_med
     else:
-        pos = (lo + np.argmin(sub, axis=1)).astype(np.float64)
+        idx = np.argmin(sub, axis=1)
+        pos = (lo + idx).astype(np.float64) + _subpixel_offset(sub, idx)
         contrast = row_med - np.min(sub, axis=1)
 
     noise = np.median(np.abs(sub - row_med[:, None])) * 1.4826 + 1e-6
