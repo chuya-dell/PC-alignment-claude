@@ -15,7 +15,7 @@
   **実データを読む処理はユーザーのPCでのみ実行**。開発・合成データ検証はサンドボックスで完結する。
 
 ## 実データの物理パラメータ(診断で確定済み)
-- 入力フォルダ: `F:\GoogleDrive_local\1.実験データ_gdrive\5.生データ D\260704 sam 位置合わせ test\df`
+- 入力フォルダ: `F:\GoogleDrive_local\1.実験データ_gdrive\4.生データ\4.生データ D\260704 sam 位置合わせ test\df`
 - ファイル名規則: `条件-セット-連番`。連番0=pre、連番1=post。画像は 2048×2044, 16bit。
 - **実ピラーピッチ ≈ 6.29px**(私のFFTとAntigravityの2D FFTが一致)。
 - **pixel pitch ≈ 32 nm/px**(当初申告の60は約1.9倍過大)。設計200nm=6.29px と整合。
@@ -63,7 +63,7 @@
 ```
 cd C:\Users\chuya\pc-alignment-claude
 git pull
-python batch_register_images.py --input-dir "F:\GoogleDrive_local\1.実験データ_gdrive\5.生データ D\260704 sam 位置合わせ test\df" --output-dir analysis_batch --save-patch-overlay
+python batch_register_images.py --input-dir "F:\GoogleDrive_local\1.実験データ_gdrive\4.生データ\4.生データ D\260704 sam 位置合わせ test\df" --output-dir analysis_batch --save-patch-overlay
 ```
 主な調整オプション: `--scratch-min-confidence`(既定0.35)、`--scratch-trace-tol`(既定20)、
 `--scratch-min-contrast`(既定2.0)、`--scratch-crop-margin`(既定250)、
