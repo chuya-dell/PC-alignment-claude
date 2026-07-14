@@ -209,16 +209,16 @@ def _trace_line(band: np.ndarray, line_axis: int, polarity: str,
 
     # インライア行に対する position の1次傾き(=線の傾き, m座標系: d(position)/d(row))。
     # 回転推定に使う。インライアが少ない/短い場合は 0(傾き無し)とする。
+    # position 自体はインライアの中央値のまま(2nd passで得た正しいインライア集合を使う点が
+    # 傾き対応の本体)。線が直線からズレて実際に湾曲している視野(画像端付近で急に曲がる等)では、
+    # フィット直線を観測範囲外の基準行まで外挿すると誤差が増幅されるため、内挿で完結する
+    # 中央値の方が安全(2024/07: 実データ7-4でband中心行への外挿が原因の残差悪化を確認し撤回)。
     rows = idx_rows[inlier]
     if rows.size >= 10 and (rows.max() - rows.min()) >= 0.25 * N:
-        slope, intercept = np.polyfit(rows, pos[inlier], 1)
-        # position は「傾いた線をband中心行(N/2)で評価した値」とする(pre/postで一貫した
-        # 基準行を使うことで、傾きにより支配的クラスタの行範囲がpre/postで微妙にずれても
-        # 位置の再現性を保つ。インライアの中央値だと傾いた線では基準行がpre/postでずれ得る)。
-        result["position"] = float(slope * (N / 2.0) + intercept)
+        slope = float(np.polyfit(rows, pos[inlier], 1)[0])
     else:
         slope = 0.0
-        result["position"] = float(np.median(pos[inlier])) if inlier.any() else result["position"]
+    result["position"] = float(np.median(pos[inlier])) if inlier.any() else result["position"]
     result["angle_rad"] = float(np.arctan(slope))
     return result
 
