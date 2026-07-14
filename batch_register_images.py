@@ -173,29 +173,52 @@ def _trace_line(band: np.ndarray, line_axis: int, polarity: str,
     if N < 10:
         return result
 
-    # 1次元モード: 幅 2*tol の窓に最も多くの行の極値位置が入る位置を探す
-    order = np.argsort(pos)
-    sp = pos[order]
-    right = np.searchsorted(sp, sp + 2.0 * tol, side="right")
-    counts = right - np.arange(len(sp))
-    bi = int(np.argmax(counts))
-    count = int(counts[bi])
-    win_lo, win_hi = sp[bi], sp[bi] + 2.0 * tol
-    inlier = (pos >= win_lo) & (pos <= win_hi)
+    def _windowed_mode(values: np.ndarray) -> np.ndarray:
+        """幅 2*tol の窓に最も多くの行の位置が入るクラスタを inlier マスクで返す。"""
+        order = np.argsort(values)
+        sv = values[order]
+        right = np.searchsorted(sv, sv + 2.0 * tol, side="right")
+        counts = right - np.arange(len(sv))
+        bi = int(np.argmax(counts))
+        win_lo, win_hi = sv[bi], sv[bi] + 2.0 * tol
+        return (values >= win_lo) & (values <= win_hi)
 
+    idx_rows = np.arange(N, dtype=np.float64)
+
+    # 1次元モード(1st pass): 生の位置でクラスタリング。線がほぼ傾いていなければこれで十分。
+    inlier = _windowed_mode(pos)
+
+    # 2nd pass: 線に実傾き(数度でも画像全高では数十px動き得る)があると、1st passの窓
+    # (幅2*tol)は全長のごく一部しか拾えず信頼度が低くなる。1st passの結果で暫定的に
+    # 傾きを推定し、傾きを除去(デトレンド)した位置で再クラスタリングする。デトレンド後は
+    # 傾きの影響が消えて波打ちのみが残るため、傾いた線でも正しく支配的クラスタを拾える。
+    if inlier.sum() >= 10:
+        rows0 = idx_rows[inlier]
+        if rows0.max() - rows0.min() >= 0.25 * N:
+            slope0 = np.polyfit(rows0, pos[inlier], 1)[0]
+            detrended = pos - slope0 * idx_rows
+            inlier2 = _windowed_mode(detrended)
+            if inlier2.sum() > inlier.sum():
+                inlier = inlier2
+
+    count = int(inlier.sum())
     result["confidence"] = float(count) / N
-    result["position"] = float(np.median(pos[inlier]))
     result["waviness"] = float(np.std(pos[inlier])) if inlier.sum() > 1 else 0.0
     med_contrast = np.median(contrast[inlier]) if inlier.any() else 0.0
     result["contrast_snr"] = float(med_contrast / noise)
 
     # インライア行に対する position の1次傾き(=線の傾き, m座標系: d(position)/d(row))。
     # 回転推定に使う。インライアが少ない/短い場合は 0(傾き無し)とする。
-    rows = np.nonzero(inlier)[0].astype(np.float64)
+    rows = idx_rows[inlier]
     if rows.size >= 10 and (rows.max() - rows.min()) >= 0.25 * N:
-        slope = float(np.polyfit(rows, pos[inlier], 1)[0])
+        slope, intercept = np.polyfit(rows, pos[inlier], 1)
+        # position は「傾いた線をband中心行(N/2)で評価した値」とする(pre/postで一貫した
+        # 基準行を使うことで、傾きにより支配的クラスタの行範囲がpre/postで微妙にずれても
+        # 位置の再現性を保つ。インライアの中央値だと傾いた線では基準行がpre/postでずれ得る)。
+        result["position"] = float(slope * (N / 2.0) + intercept)
     else:
         slope = 0.0
+        result["position"] = float(np.median(pos[inlier])) if inlier.any() else result["position"]
     result["angle_rad"] = float(np.arctan(slope))
     return result
 
