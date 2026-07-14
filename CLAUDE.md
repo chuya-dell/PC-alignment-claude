@@ -89,9 +89,19 @@ python -c "import pandas as pd; d=pd.read_csv('analysis_batch/registration_summa
   dxy_coarseがほぼ0の視野ですら残差244px等、物理的ズレでは説明不能な挙動。
   原因は _scratch_residual が縦傷の極性を横傷検出にも流用するバグ(実データは縦横で
   極性が異なる視野が多い)→ 誤極性で無関係な特徴を掴み見かけ上の残差が跳ね上がっていた。
-→(**polarity_v/polarity_h 分離で修正: 本コミット 2a1f2c4**)← 最新。合成データに
-  縦横極性不一致シーンの回帰テストを追加(修正前に実際に失敗することを確認済み)、
-  全テストPASS。**実データでの再検証がまだ済んでいない**(要ユーザー再実行)。
+→(polarity_v/polarity_h 分離で修正: commit 2a1f2c4)→ **実データ再実行で判明**:
+  scratch_residual_px median 21px→6.4pxに改善したが、4-1(confidence=0.925という
+  高信頼度)が residual=140.000000px のまま(修正前後で完全に同一)残った。
+  diagnose_scratch.py --image2 の可視化(ユーザーPC)で調査 → 傷十字は画像左上隅付近
+  (x≈110,y≈148)にあり、pre→postの並進dy=-20.5は上方向。_scratch_residual内の
+  apply_warpがBORDER_CONSTANT(0埋め)だったため、位置合わせ後の画像上端約20行が
+  無効領域として真っ黒に埋まり、探索窓内でこの人工的な黒縁を傷の影より暗い候補として
+  誤検出(黒縁までの距離≈140px=実測残差と一致)。
+→(**_scratch_residual内のwarpをBORDER_REPLICATEに変更して修正: 本コミット 390660e**)
+  ← 最新。実データ4-1を模した合成テスト(傷十字が画像端付近+境界方向シフト)を追加し、
+  修正前に実際に residual=140.00px(実データと同値)を再現、修正後 residual=1.00px に
+  改善することを検証。全テストPASS。**実データでの再検証がまだ済んでいない**
+  (要ユーザー再実行)。
 
 ## 次アクション(NEXT)
 1. **[ユーザー] 最新版で再実行し scratch_residual_px を確認**(上の新・品質チェックコマンド)。
