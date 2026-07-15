@@ -209,16 +209,23 @@ def _trace_line(band: np.ndarray, line_axis: int, polarity: str,
 
     # インライア行に対する position の1次傾き(=線の傾き, m座標系: d(position)/d(row))。
     # 回転推定に使う。インライアが少ない/短い場合は 0(傾き無し)とする。
-    # position 自体はインライアの中央値のまま(2nd passで得た正しいインライア集合を使う点が
-    # 傾き対応の本体)。線が直線からズレて実際に湾曲している視野(画像端付近で急に曲がる等)では、
-    # フィット直線を観測範囲外の基準行まで外挿すると誤差が増幅されるため、内挿で完結する
-    # 中央値の方が安全(2024/07: 実データ7-4でband中心行への外挿が原因の残差悪化を確認し撤回)。
+    #
+    # position は「インライア行集合の中央値」をそのまま使うのではなく、フィット直線を
+    # band中心行(N/2)で評価した値とする。ただし観測されたインライア行範囲外への外挿は
+    # 線が実際に湾曲している視野(7-4)で誤差を増幅するため、評価行を観測範囲内にクランプする。
+    # 中央値だけに戻すと、傾いた線でpre/postのインライア行集合が(実オフセットや波打ちで)
+    # 異なる範囲になった場合、pre/postが実質的に別の行でpositionを評価することになり、
+    # 行差×tan(傾き)の見かけ上のズレが生じる(pre/post共通の基準行がないため)。
+    # band中心行という固定基準に評価行をクランプすることで、pre/postが可能な限り同じ
+    # 基準に揃い、かつ湾曲線での外挿暴走も避けられる。
     rows = idx_rows[inlier]
     if rows.size >= 10 and (rows.max() - rows.min()) >= 0.25 * N:
         slope = float(np.polyfit(rows, pos[inlier], 1)[0])
+        row_ref = float(np.clip(N / 2.0, rows.min(), rows.max()))
+        result["position"] = float(np.median(pos[inlier]) + slope * (row_ref - np.median(rows)))
     else:
         slope = 0.0
-    result["position"] = float(np.median(pos[inlier])) if inlier.any() else result["position"]
+        result["position"] = float(np.median(pos[inlier])) if inlier.any() else result["position"]
     result["angle_rad"] = float(np.arctan(slope))
     return result
 
