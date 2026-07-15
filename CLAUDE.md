@@ -4,7 +4,8 @@
 新しいセッションはこのファイルを読めば現状・実行方法・次アクションが分かる。
 
 - リポジトリ: `chuya-dell/PC-alignment-claude`
-- 作業ブランチ: `claude/batch-image-registration-qe4cp7`(**mainではなくこのブランチで作業**)
+- 作業ブランチ: `claude/scratch-landmark-intersection-btlmqb`(**mainではなくこのブランチで作業**。
+  旧作業ブランチ`claude/batch-image-registration-qe4cp7`の履歴を引き継いでいる)
 - 依存: `pip install -r requirements.txt`(numpy, opencv-python, scipy, pandas, matplotlib, tifffile)
 - 元となった単発版: `register_images.py`(このリポジトリのmainにある初期版)
 
@@ -148,24 +149,31 @@ python -c "import pandas as pd; d=pd.read_csv('analysis_batch/registration_summa
   合成ケース(Test D: 真のdx=15pxに対し測定dx=+1.25px、バイアス13.75px)で失敗。
   理由: 傷十字の交点自体が(dx,dy)移動しているのに固定行でx評価すると
   `dx - slope×dy` という別の量を測ってしまう(幾何学的に当然の帰結)。
-  → **正しい修正の方向性(未実装、コミット68f... 実装前に方針確認中)**: 縦傷のxは
-  横傷のy(=交点の実際の行)で、横傷のyは縦傷のx(=交点の実際の列)で評価する必要が
-  ある(縦横の直線式の連立方程式として交点を解く)。`_trace_line`が"position"を
-  単独確定する今の構造では出来ず、`detect_scratch_landmark`側で縦横の切片・傾きを
-  受け取ってから交点を解く構造変更が必要。ユーザーに方針を確認中。
+  → ユーザーに方針確認 → **交点ベースの位置推定で進めることに決定**。
+→(**`_trace_line`が"position"を単独確定する構造をやめ、band内ローカル座標の
+  直線式(intercept+slope)を返すだけにし、`detect_scratch_landmark`側で縦横の
+  直線式を連立方程式として解いて実際の交点(x,y)を求める構造に変更: commit
+  cb30363**)→ **合成10ケース(直線/傾き/波打ち/コーナー湾曲/Test Dの各種
+  オフセット変形)で検証**: Test Dの本命ケース(dx=15,dy=300, 縦3°/横1°傾き)の
+  バイアスが13.75px→0.25pxに低減。他9ケース(傾き単体・波打ち単体・波打ち+傾き・
+  コーナー湾曲・dx/dy逆方向の大オフセット等)も全てPASS(合成レンダラのノイズ床
+  ~1px以内)。**サンドボックス合成テストでは5つ目のバグは解消したと判断できるが、
+  実データでの再検証はまだ行っていない**(次アクション参照)。
 
 ## 到達点(2026-07-15時点、更新中)
-scratch_residual_px median は 21.21→6.4→5.0→3.61→3.7px(62710bd)と推移。4つの実バグ
-(極性軸混同/境界黒縁誤検出/pre-post極性不一致/傾き非対応モード投票)は発見・修正・
-合成テストで再発防止済みだが、**5つ目のバグ(傾き対応の副作用: pre/postのインライア
-可視域ズレによる基準行不一致)を追跡中**。band中心クランプでは直らないと合成テストで
-判明し、交点ベースの位置推定という一段大きい構造変更が必要と分かった段階。
-バグ探索フェーズは継続中。
+scratch_residual_px median は 21.21→6.4→5.0→3.61→3.7px(62710bd)と推移。5つの実バグ
+(極性軸混同/境界黒縁誤検出/pre-post極性不一致/傾き非対応モード投票/交点位置の
+基準行不一致)を発見・修正・合成テストで再発防止済み(cb30363で交点ベース位置推定に
+構造変更、合成10ケースPASS)。**ただしこの構造変更は実データではまだ一度も検証して
+いない**。合成テストで直っても実データ固有の挙動(ノイズ、コントラスト、湾曲等)で
+新たな問題が出た前例(cbd846b→7-4回帰等)が複数あるため、実データ再実行は必須。
 
 ## 次アクション(NEXT)
-1. **[要方針確認]** 交点ベースの位置推定(縦横の直線式を連立して交点を解く)に進むか、
-   ユーザーと確認中。実装したら合成テスト(Test D等)→ユーザーPCで
-   `F:\GoogleDrive_local\1.実験データ_gdrive\TEST` を使った実データ再検証の順で進める。
+1. **[ユーザーPCで実データ再検証]** commit cb30363(交点ベース位置推定)の効果を
+   `F:\GoogleDrive_local\1.実験データ_gdrive\4.生データ\4.生データ D\260704 sam 位置合わせ test\df`
+   で確認。`git pull` → 実行方法セクション参照 → 品質チェックスクリプトで
+   scratch_residual_px median/maxと残差>2pxの視野数を確認。悪化した視野があれば
+   `diagnose_scratch.py --image2` で個別診断。
 2. **[ユーザー] pixel pitch ≈ 32 nm/px を顕微鏡キャリブレーションで確認。**
 3. **[ユーザー] -anti の残ブランチ `claude/batch-image-registration-qe4cp7` を削除**
    (私はegressポリシー403で削除不可。GitHub UIのBranchesから)。
