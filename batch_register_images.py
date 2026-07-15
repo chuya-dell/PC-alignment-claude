@@ -169,7 +169,7 @@ def _trace_line(band: np.ndarray, line_axis: int, polarity: str,
     noise = np.median(np.abs(sub - row_med[:, None])) * 1.4826 + 1e-6
     result = {"position": float(np.median(pos)), "confidence": 0.0,
               "contrast_snr": 0.0, "waviness": float(np.std(pos)), "polarity": polarity,
-              "angle_rad": 0.0}
+              "angle_rad": 0.0, "slope": 0.0, "intercept": float(np.median(pos))}
     if N < 10:
         return result
 
@@ -208,24 +208,24 @@ def _trace_line(band: np.ndarray, line_axis: int, polarity: str,
     result["contrast_snr"] = float(med_contrast / noise)
 
     # インライア行に対する position の1次傾き(=線の傾き, m座標系: d(position)/d(row))。
-    # 回転推定に使う。インライアが少ない/短い場合は 0(傾き無し)とする。
+    # 回転推定と、detect_scratch_landmark側での交点ベース位置推定に使う。
+    # インライアが少ない/短い場合は 0(傾き無し、線を band内で一定位置とみなす)とする。
     #
-    # position は「インライア行集合の中央値」をそのまま使うのではなく、フィット直線を
-    # band中心行(N/2)で評価した値とする。ただし観測されたインライア行範囲外への外挿は
-    # 線が実際に湾曲している視野(7-4)で誤差を増幅するため、評価行を観測範囲内にクランプする。
-    # 中央値だけに戻すと、傾いた線でpre/postのインライア行集合が(実オフセットや波打ちで)
-    # 異なる範囲になった場合、pre/postが実質的に別の行でpositionを評価することになり、
-    # 行差×tan(傾き)の見かけ上のズレが生じる(pre/post共通の基準行がないため)。
-    # band中心行という固定基準に評価行をクランプすることで、pre/postが可能な限り同じ
-    # 基準に揃い、かつ湾曲線での外挿暴走も避けられる。
+    # position は band内での「インライア行集合の中央値」(pre/postで基準行が揃う保証はない)。
+    # 傷十字の交点自体が(dx,dy)だけ動く実データでは、固定行でpositionを比較すると
+    # 行差×tan(傾き)分の見かけ上のズレが混入する(1つ前の band中心クランプ案でも
+    # 解決できないと合成テストで判明)。そのため position 単独ではなく、intercept
+    # (row_local=0でのposition)とslopeを返し、呼び出し側(detect_scratch_landmark)で
+    # 縦横の直線式を連立させて実際の交点で評価する。
     rows = idx_rows[inlier]
     if rows.size >= 10 and (rows.max() - rows.min()) >= 0.25 * N:
         slope = float(np.polyfit(rows, pos[inlier], 1)[0])
-        row_ref = float(np.clip(N / 2.0, rows.min(), rows.max()))
-        result["position"] = float(np.median(pos[inlier]) + slope * (row_ref - np.median(rows)))
     else:
         slope = 0.0
-        result["position"] = float(np.median(pos[inlier])) if inlier.any() else result["position"]
+    result["position"] = float(np.median(pos[inlier])) if inlier.any() else result["position"]
+    result["slope"] = slope
+    result["intercept"] = (float(np.median(pos[inlier]) - slope * np.median(rows))
+                            if inlier.any() else result["position"])
     result["angle_rad"] = float(np.arctan(slope))
     return result
 
@@ -240,6 +240,36 @@ def _detect_line(band: np.ndarray, line_axis: int, polarity: str,
     kb = (rb["confidence"], rb["contrast_snr"])
     kd = (rd["confidence"], rd["contrast_snr"])
     return rb if kb >= kd else rd
+
+
+def _intersect_scratch_lines(v: dict, hln: dict, vc0: float, vr0: float,
+                             hc0: float, hr0: float) -> tuple:
+    """縦傷・横傷の直線式(band内ローカルのintercept/slope)から、十字の実際の
+    交点(x, y、画像全体座標)を連立方程式で解く。
+
+    傷十字が(dx, dy)だけ動く実データでは、pre/postで固定した基準行(列)で
+    positionを評価すると、その行が交点の実際の行と一致しない場合に
+    行差×tan(傾き)分の見かけ上のズレが混入する(band中心クランプでは
+    直らないと合成テストで判明済み)。正しくは、縦傷のxは横傷のy(=交点の
+    実際の行)で、横傷のyは縦傷のx(=交点の実際の列)で評価する必要があり、
+    これは以下の連立方程式になる:
+
+      縦傷: x_local = v_intercept + v_slope * row_local, row_local = y - vr0
+        => x = (vc0 + v_intercept - v_slope*vr0) + v_slope * y      ...(1)
+      横傷: y_local = h_intercept + h_slope * col_local, col_local = x - hc0
+        => y = (hr0 + h_intercept - h_slope*hc0) + h_slope * x      ...(2)
+
+    (1)(2)をx, yについて解く。分母(1 - v_slope*h_slope)が0に近い退化ケース
+    (通常の傷角度では起こらない)のみ、band内評価位置にフォールバックする。
+    """
+    A = vc0 + v["intercept"] - v["slope"] * vr0
+    B = hr0 + hln["intercept"] - hln["slope"] * hc0
+    denom = 1.0 - v["slope"] * hln["slope"]
+    if abs(denom) < 1e-9:
+        return vc0 + v["position"], hr0 + hln["position"]
+    x = (A + v["slope"] * B) / denom
+    y = B + hln["slope"] * x
+    return x, y
 
 
 def detect_scratch_landmark(
@@ -273,7 +303,6 @@ def detect_scratch_landmark(
     v_band = img[vr0:vr1, vc0:vc1].astype(np.float64)
     v = _detect_line(v_band, line_axis=0, polarity=polarity_v or polarity,
                      edge_margin=edge_margin, smooth_window=smooth_window, tol=trace_tol)
-    scratch_x = vc0 + v["position"]
 
     hr0, hr1 = h_row_range if h_row_range else (0, h)
     hc0, hc1 = h_col_band if h_col_band else (0, w)
@@ -282,7 +311,8 @@ def detect_scratch_landmark(
     h_band = img[hr0:hr1, hc0:hc1].astype(np.float64)
     hln = _detect_line(h_band, line_axis=1, polarity=polarity_h or polarity,
                        edge_margin=edge_margin, smooth_window=smooth_window, tol=trace_tol)
-    scratch_y = hr0 + hln["position"]
+
+    scratch_x, scratch_y = _intersect_scratch_lines(v, hln, vc0, vr0, hc0, hr0)
 
     return {"x": scratch_x, "y": scratch_y,
             "confidence_x": v["confidence"], "confidence_y": hln["confidence"],
