@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/opt/pw-browsers/chromium*)",
+      "Bash(chromium*)",
+      "Bash(chromium-browser*)",
+      "Bash(google-chrome*)",
+      "Bash(npx playwright*)"
+    ]
+  }
+}
